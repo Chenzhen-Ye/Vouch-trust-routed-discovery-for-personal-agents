@@ -49,6 +49,12 @@ DECAY_STEPS = 3      # 每个周期代表「一段时间不互动」
 COLLAB_RETRIES = 2         # 协作超时重试次数（临时抖动先给机会）
 CHURN_PENALTY = 0.1        # churn 失败惩罚（远小于 BETA：临时掉线不该重罚）
 
+# Sybil 防御参数
+ROUTE_TRUST_THRESHOLD = 0.6  # 信任度低于此值的熟人【不参与路由】，只记录
+                             # 核心：Mallory 的傀儡都是新面孔（弱信任），进不了路由核心层
+INTRO_QUOTA = 2              # 每个熟人每周期最多「引荐」INTRO_QUOTA 个新面孔给我
+                             # 卡住「伪造大量身份刷量」——傀儡再多，经一个熟人只能进来 N 个
+
 RELATED = {
     "law":     frozenset({"law", "finance", "contract", "policy"}),
     "writing": frozenset({"writing", "editing", "blog", "translation"}),
@@ -75,6 +81,7 @@ class Acquaintance:
     last_seen: int = 0        # 最后一次协作的「逻辑时钟」步
     interactions: int = 0     # 累计协作次数
     blocked: bool = False    # 是否被拉黑（保留记录，不参与路由）
+    intro_count: int = 0     # 本周期已「引荐」给我多少新面孔（Sybil 引荐名额）
 
 
 REGISTRY = {}
@@ -192,13 +199,18 @@ class Agent:
         await self._forward(msg2)
 
     async def _forward(self, msg):
-        cands = [a for a in self.acq.values() if not a.blocked]
+        # Sybil 防御核心：弱连接（trust < ROUTE_TRUST_THRESHOLD）不参与路由。
+        # Mallory 的傀儡都是新面孔（弱信任），进不了路由核心层。
+        cands = [a for a in self.acq.values() if not a.blocked
+                 and a.trust >= ROUTE_TRUST_THRESHOLD]
         if not cands:
             return
         ports = ([a.port for a in cands] if msg.get("strategy") == "flood"
                   else self._guided_pick(msg, cands))
         names = [self._name_of_port(p) for p in ports]
-        print(f"{self.tag} 转发(ttl={msg['ttl']}, strat={msg.get('strategy')}) → {names}")
+        weak = [n for n, a in self.acq.items() if not a.blocked and a.trust < ROUTE_TRUST_THRESHOLD]
+        print(f"{self.tag} 转发(ttl={msg['ttl']}, strat={msg.get('strategy')}) → {names}"
+              + (f"  [弱连接不路由: {weak}]" if weak else ""))
         for p in ports:
             await self._send(p, msg)
 
@@ -213,8 +225,8 @@ class Agent:
         scored = []
         for a in cands:
             tag = len(a.tags & rel)
+            # 桥梁度：只数「强连接」熟人（抗 Sybil——傀儡互抬的虚高 degree 失效）
             hub = 0.3 * (a.degree / max_deg)
-            # 信任度也纳入评分：更信的人，更愿意把话筒给他
             trust_w = 0.2 * a.trust
             scored.append((tag + hub + trust_w, a.trust, a.port))
         scored.sort(reverse=True)
@@ -238,11 +250,14 @@ class Agent:
         await self._send(path[i - 1]["port"], msg)
 
     def _deliver(self, resp):
+        path = resp["path"]
+        # 介绍人 = path 倒数第二跳（把目标介绍给我的那个人）
+        introducer = path[-2]["name"] if len(path) >= 2 else None
         print(f"{self.tag} 收到结果：找到 {resp['found']['name']} "
-              f"路径={' → '.join(p['name'] for p in resp['path'])}")
+              f"路径={' → '.join(p['name'] for p in path)} 介绍人={introducer}")
         f = self._pending.get(resp["query_id"])
         if f and not f.done():
-            f.set_result(resp)
+            f.set_result({"found": resp["found"], "path": path, "introducer": introducer})
 
     # ---------- 协作 + 反馈（核心新增）----------
     async def collaborate(self, found, task):
@@ -345,12 +360,24 @@ class Agent:
         return removed
 
     # ---------- 发现即扩展 ----------
-    def remember(self, found, trust=0.4):
-        if found["name"] not in self.acq:
-            self.acq[found["name"]] = Acquaintance(found["name"], found["port"],
-                set(found.get("caps", [])), trust, degree=1, last_seen=tick())
-            return True
-        return False
+    def remember(self, found, trust=0.4, introducer=None):
+        """把发现到的目标加入熟人表。
+        Sybil 防御：introducer（路径上的介绍人）每周期引荐名额 INTRO_QUOTA。
+        超额则拒绝接受此新面孔——卡住「伪造大量身份刷量」。
+        """
+        if found["name"] in self.acq:
+            return False
+        # 检查介绍人的引荐名额
+        if introducer and introducer in self.acq:
+            intro_acq = self.acq[introducer]
+            if intro_acq.intro_count >= INTRO_QUOTA:
+                print(f"{self.tag} ⚠ 拒绝引荐：{introducer} 本周期引荐名额"
+                      f"({INTRO_QUOTA})已满，不接受新面孔 {found['name']}")
+                return False
+            intro_acq.intro_count += 1
+        self.acq[found["name"]] = Acquaintance(found["name"], found["port"],
+            set(found.get("caps", [])), trust, degree=1, last_seen=tick())
+        return True
 
 
 def build_graph():
@@ -383,15 +410,24 @@ def build_graph():
     REGISTRY["Bob"].knows("Dave", REGISTRY["Dave"].port, ["law", "finance"], 0.6)
     for ag in REGISTRY.values():
         for name, acq in ag.acq.items():
-            acq.degree = len(REGISTRY[name].acq)
+            # degree 只数「强连接」熟人：抗 Sybil。
+            # 否则 Mallory 的傀儡互抬会让 degree 虚高，桥梁度评分被污染。
+            other = REGISTRY.get(name)
+            if other:
+                acq.degree = sum(1 for x in other.acq.values()
+                                 if x.trust >= ROUTE_TRUST_THRESHOLD)
             acq.last_seen = tick()
     return list(REGISTRY.values())
 
 
 def _set_degree_all():
+    """重新计算所有 degree（只数强连接）。加边后调用。"""
     for ag in REGISTRY.values():
         for name, acq in ag.acq.items():
-            acq.degree = len(REGISTRY[name].acq) if name in REGISTRY else 0
+            other = REGISTRY.get(name)
+            if other:
+                acq.degree = sum(1 for x in other.acq.values()
+                                 if x.trust >= ROUTE_TRUST_THRESHOLD)
 
 
 async def main():
@@ -453,6 +489,59 @@ async def main():
     print(f"    恶意 一次：trust 0.50 → {mal_acq.trust:.2f}（重罚 BETA=0.3，难建易毁）")
     print(f"  → 同样 0.50 起点，churn 一次降到 {churn_acq.trust:.2f}，恶意一次降到 {mal_acq.trust:.2f}")
     print("    临时抖动的好熟人不被误伤，长期 churn 累积才会拉黑。")
+
+    # ---- 场景4：Sybil 防御 ----
+    print("\n" + "=" * 72)
+    print("【场景4】Sybil 防御：弱连接不路由，傀儡进不了路由核心层")
+    print("=" * 72)
+    # 先把 Dave 的信任通过好协作刷高（≥0.6，可路由）——真熟人才有路由权
+    dave = REGISTRY["Dave"]
+    if "Dave" in alice.acq and alice.acq["Dave"].trust < ROUTE_TRUST_THRESHOLD:
+        for _ in range(5):
+            alice._on_collab_success(alice.acq["Dave"],
+                {"caps": ["law"]}, 0.9)   # 假装高质量协作，把 Dave trust 攒上去
+        print(f"  Dave 经多次好协作攒到 trust={alice.acq['Dave'].trust:.2f}（≥{ROUTE_TRUST_THRESHOLD}，可路由）")
+
+    # Mallory 造一批傀儡：标签匹配 law、互相认识（degree 虚高）、但弱信任 0.4
+    print("\n  Mallory 造 5 个傀儡（标签匹配 law、互抬 degree、弱信任 0.4）")
+    mallory_ports = [7101, 7102, 7103, 7104, 7105]
+    puppets = []
+    for i, p in enumerate(mallory_ports):
+        Agent(f"M{i+1}", p, ["law"])         # 傀儡都声称懂 law
+        puppets.append(f"M{i+1}")
+    # 傀儡互相认识（虚高 degree + 互抬信任）
+    for pn in puppets:
+        for qn in puppets:
+            if pn != qn:
+                REGISTRY[pn].knows(qn, REGISTRY[qn].port, ["law"], 0.4)
+    # 让 Alice 经 Bob 认识几个傀儡（弱信任 0.4）
+    for pn in puppets[:3]:
+        alice.knows(pn, REGISTRY[pn].port, ["law"], 0.4)
+    _set_degree_all()
+    weak = [n for n, a in alice.acq.items() if a.trust < ROUTE_TRUST_THRESHOLD and not a.blocked]
+    strong = [n for n, a in alice.acq.items() if a.trust >= ROUTE_TRUST_THRESHOLD and not a.blocked]
+    print(f"  Alice 熟人 → 可路由(强): {strong}  不可路由(弱): {weak}")
+    print(f"  （傀儡 M1/M2/M3 虽标签匹配 law，但 trust=0.4 < {ROUTE_TRUST_THRESHOLD}，不参与路由）")
+
+    # 启动傀儡 server
+    puppet_servers = await asyncio.gather(*[REGISTRY[n].serve() for n in puppets])
+    await asyncio.sleep(0.1)
+
+    print("\n  Alice discover('law')：看是否绕开傀儡找到真目标 Dave")
+    # 清 seen 让能重新转发（query_id 不同了，但 path visited 会重算）
+    alice._seen.clear()
+    res = await alice.discover("law", strategy="guided")
+    if res:
+        print(f"  ✓ 找到 {res['found']['name']}，路径={(' → '.join(p['name'] for p in res['path']))}")
+        print("  → guided 只在强连接里选，傀儡(弱信任)被排除，路由未被污染。")
+    else:
+        print("  ✗ 未找到（Dave 可能已被直连缓存跳过）")
+    print("\n  [对照] 若关闭 Sybil 防御（阈值=0），傀儡 M* 因标签匹配 law 会被选中转发，")
+    print("        路由被污染风险升高——这正是「弱连接不路由」要防的。")
+
+    for s in puppet_servers:
+        s.close()
+    await asyncio.gather(*[s.wait_closed() for s in puppet_servers], return_exceptions=True)
 
     # ---- 阶段3：不活跃衰减 ----
     print("\n" + "=" * 72)
