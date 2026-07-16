@@ -158,6 +158,38 @@ ct = XOR_stream(key, JSON(found))                    # 放进 response.payload_c
 
 中继只搬运 `payload_ct` 密文，无法解密。只有持 DH 私钥的源能解出 `found`。
 
+### 4.8 可验证发现与消息完整性（仅可验证版）
+
+隐私版解决了「中继看不到结果」，但留下两个缺口：中继可**冒充目标**（谎称「我是 Dave」发回假 found），可**篡改 payload**（改密文）。可验证版用非对称签名补上。
+
+**信任锚前提**：源必须**预先**（带外渠道）持有目标的验证公钥。没有预先公钥，就无法区分真假 Dave——这是 PGP 式 Web of Trust 的固有要求。预先公钥从哪来见 §5.4。
+
+**机制**：每个智能体有一对签名密钥（`priv` 自持，`pub` 带外分发）。目标在回程时对**明文 `found`** 签名：
+
+```
+目标: found = {name, port, caps}
+      found_json = canonical_json(found)
+      ct  = XOR_stream(dh_key, found_json)          # 同 §4.7 加密
+      sig = RSA_sign(target_sign_priv, found_json)   # 只有目标能签
+      resp = {..., payload_ct: ct, target_sig: sig, signer_name: name}
+源  : found_json = XOR_decrypt(dh_key, payload_ct)
+      verify(target_verify_pub, found_json, sig)    # 用预先持有的公钥验签
+```
+
+**签名放在加密里面**（对明文 found 签，不对 payload_ct 签）。理由：只有源能解密 → 只有源能验签，中继连验证都做不了，更不暴露目标身份；签的是「我是 X，我有能力 Y」这个声明本身，语义清晰。
+
+**完整性统一处理**：解密与验签一体。密文被篡改会触发两种失败之一——解密失败（XOR 流加密翻转字节致 JSON 损坏）或验签失败（签名不再匹配）。两者都归为「完整性破坏，拒绝」，等价 Encrypt-then-MAC 的完整性保证。
+
+**信任决策矩阵**（源收到响应后）：
+
+| 源的状态 | 结果 | 协作？ |
+|---|---|---|
+| 未预先持目标公钥 | `verified=False, reason=no_trust_anchor` | 否（发现即揭示但不轻信） |
+| 持公钥 + 验签通过 | `verified=True` | 是（确认本人，可协作） |
+| 持公钥 + 密文被篡改 | `verified=False, reason=integrity_broken` | 否（完整性破坏） |
+
+**残缺**：RSA 用 ~256 位模数 + PKCS#1 v1.5 式填充，纯演示。生产必须 Ed25519 或 RSA-2048 + RSASSA-PSS。安全属性（非对称、可验证）不变。
+
 ## 5. 隐私扩展：威胁模型与性质
 
 ### 5.1 信任假设
@@ -224,16 +256,16 @@ ct = XOR_stream(key, JSON(found))                    # 放进 response.payload_c
 
 ## 8. 已知局限与未来方向
 
-分析框架中**尚未实现**的工程难题：
+分析框架中的工程难题进展：
 
-| 方向 | 现状 | 待解决 |
+| 方向 | 状态 | 说明 |
 |---|---|---|
-| **churn 容错** | 假设节点常驻 | 节点下线时回信令牌链断裂（隐私版独有难题，比明文路径更脆弱） |
-| **Sybil 防御** | 无 | 塞恶意节点，看 guided（凭标签选路）是否比 flood（谁都能污染）更抗污染 |
-| **可验证发现** | 目标可被冒充 | 加目标签名/凭证，源能验证「这个 Dave 真是 Dave」 |
-| **mixnet 升级** | 上一跳端口可见 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见 |
-| **真实语义路由** | 标签集合交集 | 换向量相似度，接近真实语义路由 |
-| **消息完整性** | 无签名 | 中继篡改不可检测（需消息签名/MAC） |
+| **可验证发现** | ✅ 已实现 | 见 §4.8：目标签名，源用预先持有的验证公钥验签 |
+| **消息完整性** | ✅ 已实现 | 解密+验签一体；密文被篡改→解密失败或验签失败，拒绝 |
+| **churn 容错** | ⏳ 未实现 | 节点下线时回信令牌链断裂（隐私版独有难题，比明文路径更脆弱） |
+| **Sybil 防御** | ⏳ 未实现 | 塞恶意节点，看 guided（凭标签选路）是否比 flood（谁都能污染）更抗污染 |
+| **mixnet 升级** | ⏳ 未实现 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见 |
+| **真实语义路由** | ⏳ 未实现 | 换向量相似度，接近真实语义路由 |
 
 ## 9. 运行说明
 
@@ -243,6 +275,9 @@ python3 agentnet.py
 
 # 隐私版
 python3 agentnet_privacy.py
+
+# 可验证发现版（隐私版 + 目标签名）
+python3 agentnet_signed.py
 ```
 
 零依赖，仅 Python 标准库。端口 7001–7007 需空闲。
@@ -253,4 +288,5 @@ python3 agentnet_privacy.py
 |---|---|
 | `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作 |
 | `agentnet_privacy.py` | 隐私版：无路径 + 分布式回信令牌 + DH 加密 + 信息流审计 |
+| `agentnet_signed.py` | 可验证发现版：隐私版 + 目标签名 + 完整性校验（RSA 演示） |
 | `DESIGN.md` | 本设计文档 |
