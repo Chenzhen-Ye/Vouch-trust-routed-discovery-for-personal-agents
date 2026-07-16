@@ -40,10 +40,14 @@ GUIDED_FANOUT = 1
 
 # 信任度更新参数
 ALPHA = 0.1          # 成功协作增益
-BETA = 0.3           # 失败协作惩罚（> α，信任难建易毁）
+BETA = 0.3           # 恶意失败惩罚（响应了但质量差 / 多次 churn 失败）
 GAMMA = 0.05         # 每衰减周期
 BLOCK_THRESHOLD = 0.2   # 低于此值 → 拉黑移除
 DECAY_STEPS = 3      # 每个周期代表「一段时间不互动」
+
+# churn 容错参数（区分 churn vs 恶意失败）
+COLLAB_RETRIES = 2         # 协作超时重试次数（临时抖动先给机会）
+CHURN_PENALTY = 0.1        # churn 失败惩罚（远小于 BETA：临时掉线不该重罚）
 
 RELATED = {
     "law":     frozenset({"law", "finance", "contract", "policy"}),
@@ -242,20 +246,31 @@ class Agent:
 
     # ---------- 协作 + 反馈（核心新增）----------
     async def collaborate(self, found, task):
-        """发现到目标后，发起协作，并根据结果调整对该熟人的信任度/标签。"""
+        """发现到目标后，发起协作，并根据结果调整对该熟人的信任度/标签。
+
+        关键：区分 churn 失败 vs 恶意失败：
+          · 超时无响应 → 可能是临时 churn → 先重试 N 次，都失败才按 churn 轻罚
+          · 响应了但质量差 → 是真坑 → 按恶意重罚
+        这样临时抖动的好熟人不被误拉黑。"""
         name = found["name"]; port = found["port"]
         print(f"{self.tag} 向 {name} 发起协作：「{task}」")
-        outcome = await self._send_task(port, task)   # 返回 (result, quality) 或 None
         acq = self.acq.get(name)
         if acq is None:
-            # 陌生人：先加进熟人表（弱信任），再按结果校准
-            self.remember(found)
-            acq = self.acq[name]
+            self.remember(found); acq = self.acq[name]
         before = acq.trust
+
+        outcome = None
+        for attempt in range(1, COLLAB_RETRIES + 2):   # 1 + COLLAB_RETRIES 次
+            outcome = await self._send_task(port, task)
+            if outcome is not None:
+                break
+            if attempt <= COLLAB_RETRIES:
+                print(f"  {self.tag} 超时（可能是 churn），重试 {attempt}/{COLLAB_RETRIES}")
+
         if outcome is None:
-            # 失败：超时/无响应/被拉黑
-            self._on_collab_fail(acq)
-            print(f"  {self.tag} 协作失败 → {name} trust {before:.2f}→{acq.trust:.2f}"
+            # 多次超时 → 判为 churn 失败（长期离线或网络差），轻罚
+            self._on_churn_fail(acq)
+            print(f"  {self.tag} 协作失败(churn: 多次超时) → {name} trust {before:.2f}→{acq.trust:.2f}"
                   f"{'（拉黑）' if acq.blocked else ''}")
             return None
         result, quality = outcome
@@ -280,7 +295,14 @@ class Agent:
                 acq.blocked = True
         acq.trust = max(0.0, min(1.0, acq.trust))
 
+    def _on_churn_fail(self, acq):
+        """churn 失败（多次超时，长期离线）：轻罚，可能拉黑。"""
+        acq.trust -= CHURN_PENALTY * acq.trust
+        if acq.trust < BLOCK_THRESHOLD:
+            acq.blocked = True
+
     def _on_collab_fail(self, acq):
+        """明确的恶意失败（保留接口；当前恶意场景在 _on_collab_success 里按质量处理）。"""
         acq.trust -= BETA * acq.trust
         if acq.trust < BLOCK_THRESHOLD:
             acq.blocked = True
@@ -419,6 +441,18 @@ async def main():
         await alice.collaborate({"name": "Eve", "port": eve.port, "caps": ["writing"]}, "写文案")
     print(f"\n  Alice 对 Eve 的信任：0.40 → {alice.acq['Eve'].trust:.2f}"
           f"{'（已被拉黑）' if alice.acq['Eve'].blocked else ''}")
+
+    # --- 2c. churn vs 恶意失败的惩罚对比（区分机制演示）---
+    print("\n--- 2c. churn 失败 vs 恶意失败的惩罚对比 ---")
+    print("  一次 churn 失败（临时掉线，轻罚 CHURN_PENALTY=0.1）")
+    churn_acq = Acquaintance("TempChurn", 0, {"x"}, 0.5, last_seen=tick())
+    alice._on_churn_fail(churn_acq)
+    print(f"    churn 一次：trust 0.50 → {churn_acq.trust:.2f}（轻罚，不拉黑）")
+    mal_acq = Acquaintance("TempMal", 0, {"x"}, 0.5, last_seen=tick())
+    alice._on_collab_fail(mal_acq)
+    print(f"    恶意 一次：trust 0.50 → {mal_acq.trust:.2f}（重罚 BETA=0.3，难建易毁）")
+    print(f"  → 同样 0.50 起点，churn 一次降到 {churn_acq.trust:.2f}，恶意一次降到 {mal_acq.trust:.2f}")
+    print("    临时抖动的好熟人不被误伤，长期 churn 累积才会拉黑。")
 
     # ---- 阶段3：不活跃衰减 ----
     print("\n" + "=" * 72)
