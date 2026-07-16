@@ -1,0 +1,256 @@
+# Vouch — 个人智能体发现与协作协议设计文档
+
+> **Vouch**(引荐协议):信任受限熟人图上的多跳发现协议。每一跳中继都在为路径"背书"(vouch),这正是协议名的由来。
+> 对应实现:`agentnet.py`(明文基础版)、`agentnet_privacy.py`(隐私版)
+> 状态:最小可运行原型,零依赖,单文件,多节点真正联网跑通。
+
+## 1. 概述与设计目标
+
+探索一个去中心化的未来图景:**每个人的智能体在互联网上,只通过自己信任的熟人链发现其他智能体并与之协作**,而非把所有关系数据上交给中心化平台。
+
+核心设计约束：
+
+1. **信任受限叠加图** —— 智能体只向自己「认识的人」转发查询。信任关系是路由的约束，而非事后补的安全补丁。
+2. **可发现 + 可协作** —— 找到目标后能直接发起任务，形成「发现 → 协作」闭环。
+3. **隐私可控** —— 隐私版收紧信息流，中继只搬密文不识内容，源只学到「多远、找到谁」而非「经过谁」。
+
+## 2. 问题定位
+
+本机制本质是**信任受限社交叠加图上的分布式路由问题**。
+
+| 本机制 | 对应已知系统 |
+|---|---|
+| 每个智能体只存熟人 | 非结构化 P2P（Gnutella/Freenet） |
+| 多跳转发找目标 | 小世界路由（Kleinberg 模型 / Milgram 实验） |
+| 只在熟人间路由 | 联邦协议（ActivityPub / Fediverse actor 解析） |
+| 路径上的信任链 | 信任网络（PGP Web of Trust） |
+| 隐藏路径 + 中继搬密文 | 洋葱路由（Tor 思路，弱化版） |
+
+独特之处：把「信任关系」作为叠加层，路由只能在熟人间发生，天然提供信任模型，但也直接约束可达性。
+
+## 3. 系统架构
+
+### 3.1 节点模型
+
+每个智能体（Agent）= 一个异步 TCP 服务器（监听独立端口）+ 本地状态：
+
+| 状态 | 明文版 | 隐私版 | 说明 |
+|---|---|---|---|
+| `name`, `port`, `caps` | ✓ | ✓ | 身份、地址、自身能力集合 |
+| `acq`（熟人表） | ✓ | ✓ | `name → Acquaintance` |
+| `_seen`（去重集） | ✓ | ✓ | 已处理 `query_id`，环路防止 |
+| `_pending`（Future 表） | ✓ | ✓ | `query_id → Future`，等结果 |
+| `_envelopes`（回信令牌表） | — | ✓ | `token → 上一跳Env \| DELIVER`，分布式回程链 |
+| `_dhpriv`（DH 私钥表） | — | ✓ | `query_id → DH 私钥`（源侧） |
+
+### 3.2 熟人表条目 `Acquaintance`
+
+```
+name    : str          熟人名字
+port    : int          地址
+tags    : frozenset    语义标签（路由线索）
+trust   : float        信任度（0~1），影响引导式评分
+degree  : int          我对该熟人「连接度」的估计：桥梁度高 → 更可能是好跳板
+```
+
+**语义标签是系统能否扩展的分水岭**：无标签则引导式退化为瞎猜，系统不可扩展（退化为指数洪泛）。
+
+### 3.3 消息协议
+
+**明文版**：
+
+```
+query    : {type:"query", mode:"discover"|"lookup", capability|target,
+            strategy:"guided"|"flood", ttl:int, query_id:str,
+            path:[{name,port}], hints?:[...]}
+response : {type:"response", query_id:str, path:[...], found:{name,port,caps}}
+task     : {type:"task", from:str, task:str} → {result:str}
+```
+
+**隐私版**：
+
+```
+query    : {type:"query", mode, capability|target, strategy, ttl, query_id,
+            hop_count:int, source_dh_pub:int, return_env:{port,token}, hints?}
+response : {type:"response", query_id, hop_count, target_dh_pub:int,
+            payload_ct:hex, return_env:{port,token}}
+task     : （同明文版）
+```
+
+差异要点：
+- 隐私版 `query` **无 `path` 字段**，改用 `hop_count`（只计距离不记路径）。
+- 隐私版 `query` 多 `source_dh_pub`（源 DH 公钥，供目标端协商加密）。
+- 隐私版回程用 `return_env:{port,token}` 逐跳令牌，替代明文版的完整 `path`。
+- 隐私版 `response` 的 `found` 被 DH 会话密钥加密成 `payload_ct`，中继不可读。
+
+## 4. 核心机制
+
+### 4.1 查询模式
+
+| 模式 | 目标描述 | 匹配函数 | 隐私性 |
+|---|---|---|---|
+| `discover` | 按能力找人（"懂 law 的人"） | `capability ∈ self.caps` | 较高（能力不具身份性） |
+| `lookup` | 按身份找人（"找 Grace"） | `target == self.name` | 较低（目标名即身份） |
+
+### 4.2 路由策略
+
+源不知道目标在哪，凭什么决定转发给哪个熟人——这是整个设计最有张力的部分。
+
+| 策略 | 做法 | 消息复杂度 | 命中保证 |
+|---|---|---|---|
+| `guided`（引导式贪心） | 按「语义相关度 + 桥梁度」挑 top-k 熟人转发 | ~O(路径长) | 依赖图结构 + 标签质量 |
+| `flood`（洪泛） | 向所有熟人广播，TTL 递减 | O(d^TTL)，指数 | 高（但消息爆炸） |
+
+**引导式评分函数**：
+
+```
+discover : rel = RELATED[capability]              # 能力 → 相关标签集
+           tag = |acquaintance.tags ∩ rel|
+lookup   : tag = |acquaintance.tags ∩ hints|      # 调用方提供语义线索
+hub      = 0.3 × (degree / max_degree)            # 无直接线索时偏向桥梁熟人
+score    = tag + hub
+选择     : 按 score 降序取前 GUIDED_FANOUT 个
+```
+
+关键洞察：**纯洪泛保证能到但不可扩展；引导式高效但依赖「目标线索」**。`RELATED` 映射（能力→相关标签集）就是这条线索的载体。真实系统换成向量相似度即可。
+
+### 4.3 环路防止
+
+- **去重**：每个智能体记录已处理 `query_id`，重复即丢弃。
+- **TTL 兜底**：每跳 `ttl -= 1`，归零即停止，防失控传播。
+- **隐私版的代价**：隐藏路径 ⇒ 中继无法用「已访问集合」做剪枝；环路防止只靠 `query_id` 去重 + TTL。洪泛模式下会出现「发往已访问节点」的冗余消息（被去重丢弃，但消息已发出）——见 §7 对照。
+
+### 4.4 响应回传
+
+**明文版**：响应携带完整 `path`，沿路径原路返回。源最终拿到 `path`（知道经过谁）。
+
+**隐私版（分布式私有回信令牌）**：
+1. 源生成令牌 `token`，私存 `_envelopes[token] = DELIVER`（哨兵：收到即交付）。
+2. 每个中继收到上游 `env={port,token}`，生成**新令牌**，私存 `_envelopes[新token] = 上游env`，给下游发 `{我的port, 新token}`。
+3. 目标把加密响应发给 `return_env.port`。
+4. 中继收到响应：`pop(令牌)`，若为 `DELIVER` 则是源（解密交付）；否则转发给私存的上一跳 `env.port`，不碰密文。
+
+**性质**：回程路径散落在各中继私有内存里，**任何单条消息只含一跳的回信地址**；源只拿到结果，拿不到中间人名单。
+
+### 4.5 发现即扩展网络（路径缓存）
+
+成功发现后，源把目标以**弱信任**（默认 0.4，远低于强连接 0.9）加入熟人表。二次查询同一目标时直连命中，近 O(1)。
+
+**信任衰减的体现**：弱信任缓存值（0.4）就是「路径越长终点可信度越低」在数据结构层面的落地——若要决定是否把敏感任务交给刚发现的人，这个值是决策依据。
+
+### 4.6 发现 → 协作
+
+源用解密得到的目标端口（明文版直接用 `found.port`）发起 `task` 消息，目标执行并返回产物。**发现和协作是同一张图上的两个动作**。
+
+### 4.7 端到端加密（仅隐私版）
+
+紧凑 DH（演示用 64 位安全素数，生产需 ≥2048 位或真实曲线）：
+
+```
+P = gen_safe_prime(64)        # 全局
+G = 2
+源  : priv_s ← rand; pub_s = G^priv_s mod P          # 放进 query.source_dh_pub
+目标: priv_t ← rand; pub_t = G^priv_t mod P          # 放进 response.target_dh_pub
+       shared = pub_s^priv_t mod P  (≡ pub_t^priv_s mod P)
+key = SHA256("agentnet-priv-v1|" || shared)
+ct = XOR_stream(key, JSON(found))                    # 放进 response.payload_ct
+```
+
+中继只搬运 `payload_ct` 密文，无法解密。只有持 DH 私钥的源能解出 `found`。
+
+## 5. 隐私扩展：威胁模型与性质
+
+### 5.1 信任假设
+
+- 中继可能好奇（想多了解信息）但**诚实转发**（不篡改、不丢弃、不冒充目标）。
+- 中继之间**不合谋**（不交换各自私存的回信令牌表）。
+- 信道不抗主动篡改（无消息签名）；目标可被冒充（无可验证凭证）——见 §5.4 残缺泄漏与 §8 未实现项。
+
+### 5.2 三大收紧机制
+
+1. **无路径列表** —— 消息不再带 `path`，中继只看得到自己的上一跳/下一跳。
+2. **分布式私有回信令牌** —— 回程链散落各中继私有内存，逐跳解令牌转发，无人握有完整回程。
+3. **DH 端到端加密结果** —— `found` payload 端到端加密，中继搬密文不可读，源独享明文。
+
+### 5.3 信息流审计
+
+隐私版逐节点记录 `(query_id, name, role, info)`，把「学到/没学到什么」打印成可观测属性。典型一次 `discover("law")` 的审计表：
+
+| 节点 | 角色 | 学到了什么 | 没学到什么（关键） |
+|---|---|---|---|
+| Alice | 源 | 目标=Dave、能力、hop=1 | 中间人是谁、路由 |
+| Bob | 中继 | 上一跳=Alice、下一跳=Dave | 结果是谁（密文不可读） |
+| Dave | 目标 | 所求能力=law、上一跳端口 | 源身份（仅端口）、完整路径 |
+
+**对照明文版**：明文版源会拿到 `path=Alice→Bob→Dave`（知道是 Bob 帮的忙）；隐私版源只知道「hop=1, 找到 Dave」，Bob 不可见。
+
+### 5.4 设计性泄漏（不可消除，诚实标注）
+
+1. **发现即揭示** —— 源最终要协作，必然学到目标身份。`discover`（按能力）比 `lookup`（按人名）更私有，因能力不具身份性。这是协作类查询的宿命。
+2. **上一跳端口可见** —— 邻居本来认识你（等价 Tor 入口节点知源 IP）。要藏到对邻居都不可见，需 mixnet（洋葱+延迟+批处理），代价大。
+3. **所求能力明文** —— `capability` 必须出现在查询里（中继需它引导转发 + 自我匹配），但比具体人名更不具身份性。
+4. **DH 仅 64 位** —— 纯演示（生成快），生产必须 ≥2048 位或真实曲线。安全属性不变，仅抗破解强度。
+
+## 6. 拓扑与实验配置
+
+固定 7 节点小世界图，三个语义簇（tech / law / art-writing）+ 桥梁熟人：
+
+| 节点 | 端口 | 能力 | 簇 |
+|---|---|---|---|
+| Alice | 7001 | python, backend | tech |
+| Bob | 7002 | python, design | tech（桥梁：连 law） |
+| Carol | 7003 | design, art | art |
+| Dave | 7004 | law, finance | law |
+| Eve | 7005 | law, writing | law（桥梁：连 writing） |
+| Frank | 7006 | art, design | art |
+| Grace | 7007 | writing, editing | writing |
+
+边集（有向，带 tags 与 trust）：见源码 `build_graph()`。
+全局参数：`HOST=127.0.0.1`、`DEFAULT_TTL=6`、`GUIDED_FANOUT=1`。
+
+## 7. 运行结果对照
+
+| 场景 | 策略 | 路径 | 消息数 | 说明 |
+|---|---|---|---|---|
+| 明文 discover("law") | guided | Alice→Bob→Dave | 2 | 标签引导精准命中 |
+| 明文 discover("law") | flood | 触达全网 | 11 | 指数展开，找到 Eve 与 Dave |
+| 明文 lookup("Grace") | guided | Alice→Bob→Eve→Grace | 3 | hints 线索引导 |
+| 明文 缓存后再查 | guided | Alice→Dave | 1 | 发现即扩展，近 O(1) |
+| 隐私 discover("law") | guided | （隐藏，hop=1） | 2 | 中继搬密文，源不知路由 |
+| 隐私 discover("law") | flood | （隐藏，hop=4） | 11 | 无法剪枝的代价（含冗余） |
+| 隐私 缓存后再查 | guided | （隐藏，hop=0） | 1 | 直连，仍只暴露 1 跳 |
+
+**核心张力**：guided ≈ O(路径长) 可扩展；flood ≈ O(节点数) 保证命中但爆炸。隐私版 flood 因无法用已访问集合剪枝，冗余更显著——故**隐私版几乎必须配 guided 或缓存**，纯洪泛在隐私模式下浪费更狠。
+
+## 8. 已知局限与未来方向
+
+分析框架中**尚未实现**的工程难题：
+
+| 方向 | 现状 | 待解决 |
+|---|---|---|
+| **churn 容错** | 假设节点常驻 | 节点下线时回信令牌链断裂（隐私版独有难题，比明文路径更脆弱） |
+| **Sybil 防御** | 无 | 塞恶意节点，看 guided（凭标签选路）是否比 flood（谁都能污染）更抗污染 |
+| **可验证发现** | 目标可被冒充 | 加目标签名/凭证，源能验证「这个 Dave 真是 Dave」 |
+| **mixnet 升级** | 上一跳端口可见 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见 |
+| **真实语义路由** | 标签集合交集 | 换向量相似度，接近真实语义路由 |
+| **消息完整性** | 无签名 | 中继篡改不可检测（需消息签名/MAC） |
+
+## 9. 运行说明
+
+```bash
+# 明文基础版
+python3 agentnet.py
+
+# 隐私版
+python3 agentnet_privacy.py
+```
+
+零依赖，仅 Python 标准库。端口 7001–7007 需空闲。
+
+## 10. 文件清单
+
+| 文件 | 内容 |
+|---|---|
+| `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作 |
+| `agentnet_privacy.py` | 隐私版：无路径 + 分布式回信令牌 + DH 加密 + 信息流审计 |
+| `DESIGN.md` | 本设计文档 |
