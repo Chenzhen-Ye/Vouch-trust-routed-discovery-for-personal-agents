@@ -27,6 +27,9 @@ vouch.py — Vouch 协议整合版（明文，完整态）
 from __future__ import annotations
 import asyncio
 import json
+import hmac
+import hashlib
+import secrets
 from dataclasses import dataclass, field
 
 HOST = "127.0.0.1"
@@ -59,6 +62,17 @@ RELATED = {
     "finance": frozenset({"finance", "law", "accounting"}),
 }
 
+# ---- 身份验证（明文简化版：预共享密钥 HMAC，联动签名↔信任）----
+# §4.8 签名验「是不是本人」，§4.9 信任度校准「靠不靠谱」——两者原本平行。
+# 联动：collaborate 前先用预共享 secret 验 found 的 HMAC（验身份），
+# 验签通过才校准能力信任；验签失败拒绝协作 + 降介绍人信任（它引荐了假目标）。
+def _hmac_sign(secret: bytes, msg: bytes) -> str:
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+def _hmac_verify(secret: bytes, msg: bytes, sig: str) -> bool:
+    return hmac.compare_digest(_hmac_sign(secret, msg), sig)
+
+
 _COUNT = {}
 _DOWN: set = set()          # 模拟「下线」的节点名集合
 REGISTRY = {}
@@ -84,6 +98,7 @@ class Acquaintance:
     interactions: int = 0     # 累计协作次数
     blocked: bool = False    # 拉黑（保留记录，不参与路由）
     intro_count: int = 0     # 本周期已引荐的新面孔数（Sybil 引荐名额）
+    secret: bytes = b""      # 我预先持有的该熟人的身份密钥（信任锚，HMAC 验身份）
 
 
 class Agent:
@@ -99,10 +114,13 @@ class Agent:
         self.tag = f"[{name}@{port}]"
         # quality_fn：接任务时返回 (成品, 质量分0~1)。默认高质量；可让某些节点「坑」。
         self._quality_fn = quality_fn or (lambda task: (f"{self.name} 完成了「{task}」", 0.9))
+        # 身份密钥：本智能体自己的 secret；信任我的人预先持有它，用来验我的响应。
+        self.secret = secrets.token_bytes(16)
         REGISTRY[name] = self
 
-    def knows(self, other_name, port, tags, trust=0.8):
-        self.acq[other_name] = Acquaintance(other_name, port, set(tags), trust)
+    def knows(self, other_name, port, tags, trust=0.8, secret=b""):
+        # secret：我预先持有的 other 的身份密钥（带外信任锚）；空=暂不验该熟人身份。
+        self.acq[other_name] = Acquaintance(other_name, port, set(tags), trust, secret=secret)
 
     def _name_of_port(self, port):
         for a in self.acq.values():
@@ -228,8 +246,13 @@ class Agent:
               (msg["mode"] == "discover" and msg["capability"] in self.caps)
         if hit:
             print(f"{self.tag} ✓ 命中！路径={' → '.join(p['name'] for p in path)}")
+            found = {"name": self.name, "port": self.port, "caps": sorted(self.caps)}
+            found_json = json.dumps(found, sort_keys=True).encode()
+            # 身份验证：用自己的 secret 对 found 做 HMAC。源若预先持有我的 secret
+            # 即可验证「这响应是我发的，不是中继冒充的」。联动 §4.8↔§4.9 的关键。
+            sig = _hmac_sign(self.secret, found_json)
             resp = {"type": "response", "query_id": qid, "path": path,
-                    "found": {"name": self.name, "port": self.port, "caps": sorted(self.caps)}}
+                    "found": found, "found_json": found_json.decode(), "hmac_sig": sig}
             await self._reply_back(resp, path)
             return
         if msg["ttl"] <= 0:
@@ -324,11 +347,14 @@ class Agent:
               f"路径={' → '.join(p['name'] for p in path)} 介绍人={introducer}")
         f = self._pending.get(resp["query_id"])
         if f and not f.done():
-            f.set_result({"found": resp["found"], "path": path, "introducer": introducer})
+            f.set_result({"found": resp["found"], "path": path, "introducer": introducer,
+                          "hmac_sig": resp.get("hmac_sig"), "found_json": resp.get("found_json")})
 
     # ---------- 协作 + 反馈（拓扑维护核心）----------
-    async def collaborate(self, found, task):
+    async def collaborate(self, found, task, proof=None):
         """发现到目标后发起协作，按结果调信任度/标签。
+        联动 §4.8↔§4.9：协作前先验身份（proof={hmac_sig, found_json}）。
+        验签通过才校准能力信任；验签失败 → 拒绝协作 + 降介绍人信任。
         区分 churn 失败（超时，先重试再轻罚）vs 恶意失败（响应但质量差，重罚）。"""
         name = found["name"]; port = found["port"]
         print(f"{self.tag} 向 {name} 发起协作：「{task}」")
@@ -336,6 +362,25 @@ class Agent:
         if acq is None:
             self.remember(found); acq = self.acq[name]
         before = acq.trust
+
+        # ---- 第1段：身份验证（签名↔信任联动的关键衔接）----
+        if proof and proof.get("hmac_sig") and acq.secret:
+            ok = _hmac_verify(acq.secret, proof["found_json"].encode(), proof["hmac_sig"])
+            if not ok:
+                print(f"  {self.tag} ✗ 身份验证失败：响应非 {name} 本人（冒充）→ 拒绝协作")
+                # 降介绍人信任：它引荐了一个身份不实的目标。
+                # 守卫：介绍人不能是自己（直连路径下 path[-2]==源），也不在已拉黑集。
+                intro = proof.get("introducer")
+                if intro and intro != self.name and intro in self.acq and not self.acq[intro].blocked:
+                    intro_acq = self.acq[intro]
+                    intro_before = intro_acq.trust
+                    self._on_collab_fail(intro_acq)   # 重罚介绍人（引荐假目标）
+                    print(f"  {self.tag} 介绍人 {intro} trust "
+                          f"{intro_before:.2f}→{intro_acq.trust:.2f}（引荐了身份不实目标）")
+                else:
+                    print(f"  {self.tag} （直连目标无介绍人可降，或介绍人已拉黑）")
+                return None
+            print(f"  {self.tag} ✓ 身份验证通过：确认是 {name} 本人，进入协作")
 
         outcome = None
         for attempt in range(1, COLLAB_RETRIES + 2):
@@ -514,7 +559,11 @@ async def main():
     if res and res.get("found"):
         f = res["found"]; intro = res.get("introducer")
         alice.remember(f, introducer=intro)
-        print(f"  → Alice 记住 {f['name']}（介绍人={intro}）")
+        # 带外信任锚：Alice 通过可靠渠道预先获得 Dave 的身份密钥（secret），
+        # 后续协作前用它验「响应是不是 Dave 本人发的」（联动 §4.8↔§4.9）
+        dave = REGISTRY["Dave"]
+        alice.acq["Dave"].secret = dave.secret
+        print(f"  → Alice 记住 {f['name']}（介绍人={intro}），并带外获得其身份密钥")
     # 和 Dave 多次高质量协作，把 Dave trust 攒到可路由(≥0.6)
     # 演示用：临时让 Dave 表现「好」（quality 0.9），好协作才该攒到可路由
     dave = REGISTRY["Dave"]
@@ -610,8 +659,56 @@ async def main():
         print(f"  {n}: trust={a.trust:.2f} tags={sorted(a.tags)} "
               f"次数={a.interactions} {'[拉黑]' if a.blocked else ''}")
 
+    # ---- 阶段5：身份验证联动（签名↔信任）----
     print("\n" + "=" * 72)
-    print(" 全流程结束：发现→协作→拓扑演化→churn→Sybil 一气呵成")
+    print("【阶段5】身份验证联动：协作前验身份 → 验签通过才校准能力信任")
+    print("=" * 72)
+    # 恢复 Dave 可路由状态（前面衰减可能把它降下去了）
+    if "Dave" in alice.acq:
+        alice.acq["Dave"].trust = max(alice.acq["Dave"].trust, 0.7)
+        alice.acq["Dave"].blocked = False
+        alice.acq["Dave"].last_seen = tick()
+    # 恢复 Bob 信任（阶段2/4 可能动过）
+    if "Bob" in alice.acq:
+        alice.acq["Bob"].trust = max(alice.acq["Bob"].trust, 0.7)
+
+    print("\n--- 5a. 正常：Alice 带 Dave 的 secret，discover→collaborate 验签通过 ---")
+    alice._seen.clear()
+    res = await alice.discover("law", strategy="guided")
+    if res and res.get("found") and res.get("hmac_sig"):
+        proof = {"hmac_sig": res["hmac_sig"], "found_json": res["found_json"],
+                 "introducer": res.get("introducer")}
+        out = await alice.collaborate(res["found"], "审合同", proof=proof)
+        if out:
+            print(f"  ✓ 验签通过→协作完成→Dave trust 升至 {alice.acq['Dave'].trust:.2f}")
+
+    print("\n--- 5b. 信任锚不匹配：Dave 的 secret 与 Alice 持有的不符，验签失败 → 拒绝+降介绍人 ---")
+    # 模拟身份验证失败：把 Alice 持有的 Dave secret 换成错的（信任锚被污染/目标换密钥未通知），
+    # 真 Dave 用自己真 secret 签的 sig 验不过 → 等价于「响应者身份无法证实」。
+    # 强制走多跳路径（经 Bob 介绍），这样验证失败时能降介绍人 Bob 的信任。
+    real_secret = alice.acq["Dave"].secret
+    direct_trust = alice.acq["Dave"].trust
+    alice.acq["Dave"].trust = 0.3   # 弱连接，不路由，强制经 Bob
+    _set_degree_all()
+    alice.acq["Dave"].secret = b"wrong-secret-0123456789ab"   # 错的信任锚
+    alice._seen.clear()
+    res2 = await alice.discover("law", strategy="guided")
+    if res2 and res2.get("found") and res2.get("hmac_sig"):
+        proof = {"hmac_sig": res2["hmac_sig"], "found_json": res2["found_json"],
+                 "introducer": res2.get("introducer")}
+        bob_before = alice.acq["Bob"].trust if "Bob" in alice.acq else 0
+        out = await alice.collaborate(res2["found"], "审合同", proof=proof)
+        if out is None:
+            print(f"  ✓ 身份无法证实：拒绝协作。"
+                  + (f"介绍人 Bob trust {bob_before:.2f}→{alice.acq['Bob'].trust:.2f}"
+                     if "Bob" in alice.acq else ""))
+    # 恢复
+    alice.acq["Dave"].secret = real_secret
+    alice.acq["Dave"].trust = direct_trust
+    _set_degree_all()
+
+    print("\n" + "=" * 72)
+    print(" 全流程结束：发现→协作→拓扑演化→churn→Sybil→身份验证联动")
     print("=" * 72)
     for s in servers:
         s.close()
