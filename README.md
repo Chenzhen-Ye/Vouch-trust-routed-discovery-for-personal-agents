@@ -8,10 +8,16 @@
 
 ```
 vouch/
-├── agentnet.py            Vouch 明文基础版（路由 + 发现即扩展 + 协作）
-├── agentnet_privacy.py    Vouch 隐私版（无路径 + 分布式回信令牌 + DH 端到端加密）
-└── DESIGN.md              协议设计文档（10 节，含威胁模型与运行对照表）
+├── vouch.py               Vouch 整合版（明文完整态：发现→协作→拓扑→churn→Sybil 一气呵成）
+├── agentnet.py            明文基础版（路由 + 发现即扩展 + 协作）
+├── agentnet_privacy.py    隐私版（无路径 + 分布式回信令牌 + DH 端到端加密）
+├── agentnet_signed.py     可验证发现版（隐私版 + 目标签名）
+├── agentnet_topology.py   拓扑维护版（信任度升降 + 衰减 + 拉黑 + Sybil 防御）
+├── agentnet_churn.py      churn 容错版（回程绕断点 + 去程重试）
+└── DESIGN.md              协议设计文档（含威胁模型与运行对照表）
 ```
+
+> `vouch.py` 是四个明文分机制版本的整合，跑通端到端全流程；其余 `agentnet_*.py` 是各机制的独立演示版。
 
 ## 快速开始
 
@@ -19,6 +25,7 @@ vouch/
 
 ```bash
 cd vouch
+python3 vouch.py               # 整合版：端到端全流程（推荐先看这个）
 python3 agentnet.py            # 明文基础版
 python3 agentnet_privacy.py    # 隐私版
 ```

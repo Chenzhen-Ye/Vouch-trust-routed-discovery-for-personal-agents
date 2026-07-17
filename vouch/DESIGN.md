@@ -402,9 +402,12 @@ python3 agentnet_churn.py
 
 | 文件 | 内容 |
 |---|---|
-| `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作 |
+| `vouch.py` | **整合版（明文完整态）**：发现→协作→拓扑演化→churn→Sybil 一气呵成 |
+| `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作（分机制演示） |
 | `agentnet_privacy.py` | 隐私版：无路径 + 分布式回信令牌 + DH 加密 + 信息流审计 |
 | `agentnet_signed.py` | 可验证发现版：隐私版 + 目标签名 + 完整性校验（RSA 演示） |
 | `agentnet_topology.py` | 拓扑维护版：明文 + 信任度随协作升降 + 衰减 + 拉黑 + churn/恶意区分 + Sybil 防御 |
 | `agentnet_churn.py` | churn 容错版：明文 + 回程绕断点 + 去程多路径 + 源重试 |
+
+> `vouch.py` 是四个明文分机制版本的整合，跑通端到端全流程。其余 `agentnet_*.py` 是各机制的独立演示版（可单独运行看单个机制）。
 | `DESIGN.md` | 本设计文档 |
