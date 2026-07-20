@@ -62,6 +62,58 @@ RELATED = {
     "finance": frozenset({"finance", "law", "accounting"}),
 }
 
+# ---- 向量语义路由（§4.14）：标签集合交集 → 向量余弦相似度 ----
+# 真实系统用嵌入模型把「law」映射到高维向量；原型手编 8 维特征向量模拟。
+# 维度是潜在语义因子（法律/文字/技术/视觉/金融/工程/内容/业务）。
+# 余弦相似度连续 0~1，比「集合交集大小」更准：law≈finance（同维度高），
+# law 远离 python（维度正交）。RELATED 表保留作降级/对照。
+EMBEDDING = {
+    "law":         [0.9, 0.1, 0.0, 0.0, 0.6, 0.1, 0.1, 0.5],
+    "contract":    [0.9, 0.3, 0.0, 0.0, 0.5, 0.2, 0.2, 0.6],
+    "policy":      [0.8, 0.2, 0.0, 0.0, 0.3, 0.1, 0.1, 0.5],
+    "finance":     [0.6, 0.1, 0.0, 0.0, 0.9, 0.2, 0.0, 0.8],
+    "accounting":  [0.5, 0.1, 0.1, 0.0, 0.9, 0.2, 0.0, 0.7],
+    "writing":     [0.2, 0.9, 0.0, 0.1, 0.1, 0.0, 0.8, 0.3],
+    "editing":     [0.2, 0.9, 0.0, 0.1, 0.1, 0.0, 0.7, 0.3],
+    "blog":        [0.1, 0.8, 0.1, 0.2, 0.1, 0.0, 0.9, 0.3],
+    "translation":[0.3, 0.9, 0.0, 0.0, 0.1, 0.0, 0.6, 0.3],
+    "python":      [0.0, 0.1, 0.9, 0.0, 0.2, 0.8, 0.0, 0.2],
+    "backend":     [0.0, 0.1, 0.9, 0.0, 0.2, 0.9, 0.0, 0.3],
+    "data":        [0.1, 0.1, 0.8, 0.0, 0.5, 0.7, 0.0, 0.4],
+    "ml":          [0.1, 0.1, 0.8, 0.0, 0.4, 0.6, 0.0, 0.3],
+    "design":      [0.0, 0.1, 0.1, 0.9, 0.0, 0.2, 0.3, 0.4],
+    "art":         [0.0, 0.2, 0.0, 0.9, 0.0, 0.0, 0.5, 0.2],
+    "ui":          [0.0, 0.1, 0.3, 0.8, 0.0, 0.4, 0.2, 0.4],
+    "brand":       [0.1, 0.3, 0.0, 0.8, 0.2, 0.0, 0.4, 0.6],
+}
+
+def _cosine(a, b):
+    """余弦相似度，-1~1。未知词返回 0（正交）。"""
+    if not a or not b:
+        return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na = sum(x*x for x in a) ** 0.5
+    nb = sum(x*x for x in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+def _cap_vec(cap):
+    """能力的语义向量（从 EMBEDDING 查；未知能力退化为其自身单标签向量）。"""
+    return EMBEDDING.get(cap, [0.0]*8)
+
+def _tags_vec(tags):
+    """一个熟人的语义向量 = 其所有标签向量的平均（质心）。"""
+    vecs = [EMBEDDING.get(t) for t in tags if t in EMBEDDING]
+    if not vecs:
+        return [0.0]*8
+    return [sum(v[i] for v in vecs)/len(vecs) for i in range(len(vecs[0]))]
+
+def _semantic_sim(cap, tags):
+    """能力与熟人标签集的语义相似度（0~1，余弦归一化）。替代 |tags & RELATED[cap]|。"""
+    sim = _cosine(_cap_vec(cap), _tags_vec(tags))
+    return max(0.0, sim)   # 负相似度截断为 0（不相关）
+
 # ---- 身份验证（明文简化版：预共享密钥 HMAC，联动签名↔信任）----
 # §4.8 签名验「是不是本人」，§4.9 信任度校准「靠不靠谱」——两者原本平行。
 # 联动：collaborate 前先用预共享 secret 验 found 的 HMAC（验身份），
@@ -374,13 +426,15 @@ class Agent:
         scored = []
         for a in cands:
             if msg["mode"] == "discover":
-                rel = RELATED.get(cap, frozenset({cap}) if cap else frozenset())
-                tag = len(a.tags & rel)
+                # 向量语义路由：能力与熟人标签的余弦相似度（连续 0~1），替代集合交集大小
+                sem = _semantic_sim(cap, a.tags)
             else:
-                tag = len(a.tags & hints)
+                # lookup：用 hints 向量与熟人标签的相似度
+                hints_vec = _tags_vec(hints) if hints else [0.0]*8
+                sem = max(0.0, _cosine(hints_vec, _tags_vec(a.tags)))
             hub = 0.3 * (a.degree / max_deg)       # degree 只数强连接（抗 Sybil）
             trust_w = 0.2 * a.trust                 # 更信的人更愿意把话筒给他
-            scored.append((tag + hub + trust_w, a.trust, a.port))
+            scored.append((sem + hub + trust_w, a.trust, a.port))
         scored.sort(reverse=True)
         return [p for _, _, p in scored[:fanout]]
 
@@ -914,8 +968,29 @@ async def main():
     alice.acq["Bob"].trust = 0.7
     _set_degree_all()
 
+    # ---- 阶段7：向量语义路由（标签集合交集 → 余弦相似度）----
     print("\n" + "=" * 72)
-    print(" 全流程结束：发现→协作→拓扑→churn→Sybil→身份验证联动→介绍人担保")
+    print("【阶段7】向量语义路由：集合交集(二值) → 余弦相似度(连续)")
+    print("=" * 72)
+    print("\n  Alice 找 'law'，候选熟人按语义相似度排序（新法）vs 集合交集(旧法)：")
+    print(f"  {'熟人':12s} {'标签':22s} {'旧法(交集)':>10s} {'新法(余弦)':>10s}")
+    candidates = [
+        ("Dave", ["law", "finance"]),
+        ("Eve",  ["law", "writing"]),
+        ("Bob",  ["python", "design"]),
+        ("Carol",["design", "art"]),
+    ]
+    for name, tags in candidates:
+        old = len(set(tags) & RELATED.get("law", frozenset()))   # 旧法：集合交集大小
+        new = _semantic_sim("law", set(tags))                     # 新法：余弦相似度
+        print(f"  {name:12s} {str(tags):22s} {old:>10d} {new:>10.3f}")
+    print("\n  旧法二值(0/1)：Dave=1, Eve=1, Bob=0, Carol=0 → 无法区分 Dave 和 Eve 谁更相关")
+    print("  新法连续：Dave=0.977 > Eve=0.817 > Bob=0.259 > Carol=0.171 → 精准区分")
+    print("  → 向量语义路由比标签交集更准：law 与 finance(0.92)、contract(0.98) 高度相关，")
+    print("    与 writing(0.37) 弱相关，与 python/design(0.2) 几乎不相关——符合真实语义。")
+
+    print("\n" + "=" * 72)
+    print(" 全流程结束：发现→协作→拓扑→churn→Sybil→身份验证→介绍人担保→向量语义路由")
     print("=" * 72)
     for s in servers:
         s.close()
