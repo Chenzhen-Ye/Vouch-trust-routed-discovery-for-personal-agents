@@ -73,6 +73,78 @@ def _hmac_verify(secret: bytes, msg: bytes, sig: str) -> bool:
     return hmac.compare_digest(_hmac_sign(secret, msg), sig)
 
 
+# ---- 介绍人担保（非对称签名：discover 模式的身份验证）----
+# 对称 HMAC 防不住「持 secret 的介绍人冒充目标」（能验就能签）。
+# 非对称打破它：目标用私钥签 found（只有目标能签），介绍人/源用目标公钥验。
+# 源 discover 前不知目标，没有目标公钥——从介绍人的担保里获得「可信的目标公钥」。
+def _miller_rabin(n, k=8):
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47):
+        if n % p == 0:
+            return n == p
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d //= 2; r += 1
+    for _ in range(k):
+        a = 2 + secrets.randbelow(n - 3)
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+def _gen_prime(bits):
+    while True:
+        n = secrets.randbits(bits) | 1 | (1 << (bits - 1))
+        if _miller_rabin(n):
+            return n
+
+def _egcd(a, b):
+    if b == 0:
+        return a, 1, 0
+    g, x, y = _egcd(b, a % b)
+    return g, y, x - (a // b) * y
+
+def _modinv(a, m):
+    g, x, _ = _egcd(a % m, m)
+    if g != 1:
+        raise ValueError("无模逆")
+    return x % m
+
+def gen_keypair(bits=256):
+    """返回 (priv, pub)。e=65537。演示用小模数，生产需 ≥2048 + Ed25519/PSS。"""
+    while True:
+        p, q = _gen_prime(bits), _gen_prime(bits)
+        if p == q:
+            continue
+        n = p * q
+        phi = (p - 1) * (q - 1)
+        e = 65537
+        if _egcd(e, phi)[0] != 1:
+            continue
+        d = _modinv(e, phi)
+        if d > 1:
+            break
+    return {"n": n, "d": d}, {"n": n, "e": e}
+
+def _rsa_sign(priv, msg: bytes) -> int:
+    """对消息的 SHA256 哈希签名（教科书式 RSA，演示用；非 PSS）。"""
+    h = hashlib.sha256(msg).digest()
+    m = int.from_bytes(h, "big")
+    return pow(m, priv["d"], priv["n"])
+
+def _rsa_verify(pub, msg: bytes, sig: int) -> bool:
+    h = hashlib.sha256(msg).digest()
+    expected = int.from_bytes(h, "big")
+    return pow(sig, pub["e"], pub["n"]) == expected
+
+
 _COUNT = {}
 _DOWN: set = set()          # 模拟「下线」的节点名集合
 REGISTRY = {}
@@ -98,7 +170,8 @@ class Acquaintance:
     interactions: int = 0     # 累计协作次数
     blocked: bool = False    # 拉黑（保留记录，不参与路由）
     intro_count: int = 0     # 本周期已引荐的新面孔数（Sybil 引荐名额）
-    secret: bytes = b""      # 我预先持有的该熟人的身份密钥（信任锚，HMAC 验身份）
+    secret: bytes = b""      # 我预先持有的该熟人的 HMAC 身份密钥（lookup 验身份）
+    pub: dict = None         # 我预先持有的该熟人的 RSA 公钥（discover 介绍人担保验身份）
 
 
 class Agent:
@@ -116,11 +189,15 @@ class Agent:
         self._quality_fn = quality_fn or (lambda task: (f"{self.name} 完成了「{task}」", 0.9))
         # 身份密钥：本智能体自己的 secret；信任我的人预先持有它，用来验我的响应。
         self.secret = secrets.token_bytes(16)
+        # 非对称密钥对：priv 自己持（签名），pub 作为身份公钥（带外分发给信任方）。
+        # 介绍人担保用：目标用 priv 签 found（只有目标能签），介绍人/源用 pub 验。
+        self._rsa_priv, self.rsa_pub = gen_keypair(256)
         REGISTRY[name] = self
 
-    def knows(self, other_name, port, tags, trust=0.8, secret=b""):
-        # secret：我预先持有的 other 的身份密钥（带外信任锚）；空=暂不验该熟人身份。
-        self.acq[other_name] = Acquaintance(other_name, port, set(tags), trust, secret=secret)
+    def knows(self, other_name, port, tags, trust=0.8, secret=b"", pub=None):
+        # secret：HMAC 身份密钥（lookup）；pub：RSA 公钥（discover 介绍人担保）。带外信任锚。
+        self.acq[other_name] = Acquaintance(other_name, port, set(tags), trust,
+                                           secret=secret, pub=pub)
 
     def _name_of_port(self, port):
         for a in self.acq.values():
@@ -248,11 +325,16 @@ class Agent:
             print(f"{self.tag} ✓ 命中！路径={' → '.join(p['name'] for p in path)}")
             found = {"name": self.name, "port": self.port, "caps": sorted(self.caps)}
             found_json = json.dumps(found, sort_keys=True).encode()
-            # 身份验证：用自己的 secret 对 found 做 HMAC。源若预先持有我的 secret
-            # 即可验证「这响应是我发的，不是中继冒充的」。联动 §4.8↔§4.9 的关键。
-            sig = _hmac_sign(self.secret, found_json)
-            resp = {"type": "response", "query_id": qid, "path": path,
-                    "found": found, "found_json": found_json.decode(), "hmac_sig": sig}
+            # 身份验证（两条路径并存）：
+            # (a) HMAC：用自己的 secret 签 found（lookup 场景，源预先持我的 secret 可验）
+            # (b) RSA：用自己私钥签 found（discover 场景，介绍人持我公钥可验、源经介绍人
+            #     担保获得可信公钥后可验）。只有我能签 → 介绍人无法冒充我（非对称打破对称天花板）
+            hmac_sig = _hmac_sign(self.secret, found_json)
+            rsa_sig = str(_rsa_sign(self._rsa_priv, found_json))
+            resp = {"type": "response", "query_id": qid, "path": path, "found": found,
+                    "found_json": found_json.decode(), "hmac_sig": hmac_sig,
+                    "target_pub": self.rsa_pub, "target_sig": rsa_sig,
+                    "vouchers": []}   # 介绍人担保链，沿回程层层累积
             await self._reply_back(resp, path)
             return
         if msg["ttl"] <= 0:
@@ -319,7 +401,9 @@ class Agent:
         await self._send(path[0]["port"], resp)
 
     async def _on_response(self, msg):
-        """中继收到响应：往源方向转发，断点绕过。"""
+        """中继收到响应：往源方向转发，断点绕过。
+        若我是目标的直接上一跳（介绍人）且持有目标公钥，先验 target_sig，
+        验过才附上自己的担保签名（用自己私钥签），把可信的目标公钥传给源。"""
         path = msg["path"]
         if path[0]["name"] == self.name:
             self._deliver(msg); return
@@ -327,6 +411,22 @@ class Agent:
         if self.name not in names:
             return
         i = names.index(self.name)
+        # 介绍人担保：我是目标直接上一跳（i == len-2），且我持有目标公钥
+        if i == len(names) - 2 and msg.get("target_sig") and msg.get("target_pub"):
+            target = msg["found"]["name"]
+            acq = self.acq.get(target)
+            if acq and acq.pub:
+                ok = _rsa_verify(acq.pub, msg["found_json"].encode(), int(msg["target_sig"]))
+                if not ok:
+                    print(f"{self.tag} ⚠ 目标 {target} 的 target_sig 验签失败——不担保，丢弃")
+                    return
+                voucher_msg = (msg["found_json"] + json.dumps(msg["target_pub"], sort_keys=True)
+                               + str(msg["target_sig"])).encode()
+                voucher_sig = str(_rsa_sign(self._rsa_priv, voucher_msg))
+                msg["vouchers"] = msg.get("vouchers", []) + [{
+                    "vouching": self.name, "target": target,
+                    "target_pub": msg["target_pub"], "voucher_sig": voucher_sig}]
+                print(f"{self.tag} 担保：验过 {target} 的 target_sig，附上担保签名")
         for idx in range(i - 1, -1, -1):
             hop = path[idx]
             if hop["name"] == self.name:
@@ -348,7 +448,9 @@ class Agent:
         f = self._pending.get(resp["query_id"])
         if f and not f.done():
             f.set_result({"found": resp["found"], "path": path, "introducer": introducer,
-                          "hmac_sig": resp.get("hmac_sig"), "found_json": resp.get("found_json")})
+                          "hmac_sig": resp.get("hmac_sig"), "found_json": resp.get("found_json"),
+                          "target_pub": resp.get("target_pub"), "target_sig": resp.get("target_sig"),
+                          "vouchers": resp.get("vouchers", [])})
 
     # ---------- 协作 + 反馈（拓扑维护核心）----------
     async def collaborate(self, found, task, proof=None):
@@ -364,23 +466,56 @@ class Agent:
         before = acq.trust
 
         # ---- 第1段：身份验证（签名↔信任联动的关键衔接）----
-        if proof and proof.get("hmac_sig") and acq.secret:
-            ok = _hmac_verify(acq.secret, proof["found_json"].encode(), proof["hmac_sig"])
-            if not ok:
-                print(f"  {self.tag} ✗ 身份验证失败：响应非 {name} 本人（冒充）→ 拒绝协作")
-                # 降介绍人信任：它引荐了一个身份不实的目标。
-                # 守卫：介绍人不能是自己（直连路径下 path[-2]==源），也不在已拉黑集。
+        # 两条路径：
+        # (a) HMAC 直验：源预先持目标 secret（lookup 场景），直接验 hmac_sig。
+        # (b) 介绍人担保（discover 场景）：源持直接介绍人公钥 → 验介绍人 voucher_sig
+        #     → 从担保里取可信 target_pub → 用 target_pub 验 target_sig → 确认目标身份。
+        #     非对称：介绍人只有目标公钥（能验不能签），无法冒充目标——打破对称天花板。
+        verified = False
+        if proof:
+            found_json = proof.get("found_json", "").encode()
+            # 路径(a)：HMAC 直验
+            if proof.get("hmac_sig") and acq.secret:
+                verified = _hmac_verify(acq.secret, found_json, proof["hmac_sig"])
+                if verified:
+                    print(f"  {self.tag} ✓ HMAC 身份验证通过：确认是 {name} 本人")
+            # 路径(b)：介绍人担保
+            if not verified and proof.get("vouchers") and proof.get("target_sig"):
                 intro = proof.get("introducer")
-                if intro and intro != self.name and intro in self.acq and not self.acq[intro].blocked:
-                    intro_acq = self.acq[intro]
-                    intro_before = intro_acq.trust
-                    self._on_collab_fail(intro_acq)   # 重罚介绍人（引荐假目标）
-                    print(f"  {self.tag} 介绍人 {intro} trust "
-                          f"{intro_before:.2f}→{intro_acq.trust:.2f}（引荐了身份不实目标）")
-                else:
-                    print(f"  {self.tag} （直连目标无介绍人可降，或介绍人已拉黑）")
-                return None
-            print(f"  {self.tag} ✓ 身份验证通过：确认是 {name} 本人，进入协作")
+                intro_acq = self.acq.get(intro) if intro and intro != self.name else None
+                if intro_acq and intro_acq.pub:
+                    # 取介绍人的担保（vouching == introducer 的那条）
+                    voucher = next((v for v in proof["vouchers"]
+                                    if v["vouching"] == intro), None)
+                    if voucher:
+                        vmsg = (proof["found_json"]
+                                + json.dumps(voucher["target_pub"], sort_keys=True)
+                                + str(proof["target_sig"])).encode()
+                        vok = _rsa_verify(intro_acq.pub, vmsg, int(voucher["voucher_sig"]))
+                        if vok:
+                            # 介绍人担保可信 → 用它担保的 target_pub 验 target_sig
+                            tok = _rsa_verify(voucher["target_pub"], found_json,
+                                               int(proof["target_sig"]))
+                            verified = tok
+                            if tok:
+                                print(f"  {self.tag} ✓ 介绍人 {intro} 担保验证通过 → "
+                                      f"用其担保的公钥验 target_sig → 确认是 {name} 本人")
+                            else:
+                                print(f"  {self.tag} ✗ 介绍人担保了，但 target_sig 验不过（目标冒充）")
+                        else:
+                            print(f"  {self.tag} ✗ 介绍人 {intro} 的担保签名验不过（冒充介绍人）")
+        if proof and not verified:
+            print(f"  {self.tag} ✗ 身份验证失败：响应非 {name} 本人 → 拒绝协作")
+            intro = proof.get("introducer")
+            if intro and intro != self.name and intro in self.acq and not self.acq[intro].blocked:
+                intro_acq = self.acq[intro]
+                ib = intro_acq.trust
+                self._on_collab_fail(intro_acq)   # 重罚介绍人（引荐了身份不实目标）
+                print(f"  {self.tag} 介绍人 {intro} trust {ib:.2f}→{intro_acq.trust:.2f}"
+                      f"（引荐了身份不实目标）")
+            else:
+                print(f"  {self.tag} （直连目标无介绍人可降，或介绍人已拉黑）")
+            return None
 
         outcome = None
         for attempt in range(1, COLLAB_RETRIES + 2):
@@ -532,6 +667,9 @@ def build_graph(sparse=True):
     for ag in REGISTRY.values():
         for name, acq in ag.acq.items():
             acq.last_seen = tick()
+            # 带外信任锚：我认识的熟人，我预先持有其公钥（介绍人担保验身份用）
+            if name in REGISTRY:
+                acq.pub = REGISTRY[name].rsa_pub
     _set_degree_all()
     return list(REGISTRY.values())
 
@@ -707,8 +845,77 @@ async def main():
     alice.acq["Dave"].trust = direct_trust
     _set_degree_all()
 
+    # ---- 阶段6：介绍人担保（非对称，discover 的身份验证）----
     print("\n" + "=" * 72)
-    print(" 全流程结束：发现→协作→拓扑演化→churn→Sybil→身份验证联动")
+    print("【阶段6】介绍人担保：discover 时源不预持目标 secret，经介绍人获可信公钥")
+    print("=" * 72)
+    # 恢复 Dave/Bob 可路由
+    if "Dave" in alice.acq:
+        alice.acq["Dave"].trust = 0.7; alice.acq["Dave"].blocked = False
+        alice.acq["Dave"].last_seen = tick()
+    if "Bob" in alice.acq:
+        alice.acq["Bob"].trust = 0.7
+
+    print("\n--- 6a. 正常：Alice 不持 Dave secret（discover 场景），经 Bob 担保获可信公钥 ---")
+    # discover 场景：源发现前不知目标，故不预持目标 secret。临时清掉 Dave secret，
+    # 强制走「介绍人 Bob 担保 → Alice 用 Bob 公钥验担保 → 取 Bob 担保的 Dave 公钥验 target_sig」。
+    real_secret6 = alice.acq["Dave"].secret
+    real_pub6 = alice.acq["Dave"].pub
+    alice.acq["Dave"].secret = b""          # 模拟 discover：源不预持目标 secret
+    # 强制多跳经 Bob（Dave 弱连接不路由）
+    dt6 = alice.acq["Dave"].trust
+    alice.acq["Dave"].trust = 0.3
+    _set_degree_all()
+    alice._seen.clear()
+    res = await alice.discover("law", strategy="guided")
+    if res and res.get("vouchers"):
+        proof = {"found_json": res["found_json"], "target_sig": res["target_sig"],
+                 "vouchers": res["vouchers"], "introducer": res.get("introducer")}
+        out = await alice.collaborate(res["found"], "审合同", proof=proof)
+        if out:
+            print(f"  ✓ 介绍人担保链生效：Bob 担保→Alice 验担保→用担保公钥验 target_sig→协作完成")
+    # 恢复
+    alice.acq["Dave"].secret = real_secret6
+    alice.acq["Dave"].trust = dt6
+    _set_degree_all()
+
+    print("\n--- 6b. 介绍人无法冒充：Bob 想伪造 Dave，但没有 Dave 私钥，签不出 target_sig ---")
+    # 模拟冒充：Bob 自己充当「假 Dave」，用自己私钥签 target_sig（冒充 Dave），
+    # 并用自己私钥重新担保（声称「这是 Dave 的公钥」=其实是 Bob 的公钥）。
+    # Alice 用 Bob 担保的「Dave 公钥」（实为 Bob 公钥）验 target_sig：
+    #   Bob 用自己私钥签的 sig，用 Bob 公钥验会【通过】！——所以单验 target_sig 不够。
+    # 关键：Alice 还要验「Bob 担保的公钥 == 真 Dave 的公钥」吗？不——discover 场景
+    #   Alice 不预持 Dave 公钥，无法比对。那靠什么防？
+    #   靠「Bob 担保的是真 Dave 公钥」——但这又回到对称信任。所以：非对称签名下，
+    #   介绍人能冒充的边界是「换公钥」（Bob 说这是 Dave 公钥其实是 Bob 的），
+    #   而不是「伪造已有公钥的签名」（私钥签不出）。完整防住需多介绍人交叉验证/证书链。
+    #   此处演示最小核心：Bob 用自己私钥伪造 target_sig，vouchers 仍是真 Bob 担保的（基于真 Dave 公钥），
+    #   → voucher_sig 因 target_sig 被改而验不过；即便 Bob 重新担保，target_sig 用真 Dave 公钥验也过不了。
+    alice.acq["Dave"].secret = b""
+    alice.acq["Dave"].trust = 0.3
+    _set_degree_all()
+    alice._seen.clear()
+    res2 = await alice.discover("law", strategy="guided")
+    if res2 and res2.get("vouchers"):
+        # Bob 用自己私钥伪造 target_sig（冒充 Dave）
+        bob = REGISTRY["Bob"]
+        forged_sig = str(_rsa_sign(bob._rsa_priv, res2["found_json"].encode()))
+        proof = {"found_json": res2["found_json"], "target_sig": forged_sig,
+                 "vouchers": res2["vouchers"], "introducer": res2.get("introducer")}
+        bob_before = alice.acq["Bob"].trust
+        out = await alice.collaborate(res2["found"], "审合同", proof=proof)
+        if out is None:
+            print(f"  ✓ 介绍人冒充被识破：Bob 用自己私钥伪造的 target_sig，")
+            print(f"    经 Bob 担保的 Dave 公钥验不过 → 拒绝协作 + 降 Bob "
+                  f"{bob_before:.2f}→{alice.acq['Bob'].trust:.2f}")
+            print("  （非对称：介绍人有目标公钥能验，无私钥不能签 → 无法冒充已绑定的身份）")
+    alice.acq["Dave"].secret = real_secret6
+    alice.acq["Dave"].trust = dt6
+    alice.acq["Bob"].trust = 0.7
+    _set_degree_all()
+
+    print("\n" + "=" * 72)
+    print(" 全流程结束：发现→协作→拓扑→churn→Sybil→身份验证联动→介绍人担保")
     print("=" * 72)
     for s in servers:
         s.close()
