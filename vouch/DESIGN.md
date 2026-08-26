@@ -467,25 +467,24 @@ _guided_pick 打分      = cosine(_cap_vec(cap), _tags_vec(a.tags))  # 连续 0~
 | **身份验证联动** | ✅ 已实现 | 见 §4.12：协作前验身份(HMAC)→验签失败降介绍人信任，打通签名↔信任 |
 | **介绍人担保** | ✅ 已实现 | 见 §4.13：非对称签名，discover 时源经介绍人获可信公钥，介绍人无法冒充 |
 | **向量语义路由** | ✅ 已实现 | 见 §4.14：标签集合交集 → 余弦相似度（连续 0~1），更准且无需维护 RELATED 表 |
+| **SDK 化（全局→对象）** | ✅ 已实现 | 见 §11：REGISTRY/_DOWN/_CLOCK/_COUNT 封进 Network 类，import 无副作用，可同进程跑多网络 |
 | **mixnet 升级** | ⏳ 未实现 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见（且需先恢复隐私版） |
 
 ## 9. 运行说明
 
 ```bash
-# 明文基础版
-python3 agentnet.py
+# SDK 化后（推荐）：从仓库根
+pip install -e .                      # 可选：装成可 import 的库
+python examples/full_flow.py         # 7 阶段端到端演示（整合版，明文完整态）
+pytest tests/ -q                      # 冒烟测试
+vouch-demo                            # 装后命令行入口（等价 full_flow）
 
-# 隐私版
-python3 agentnet_privacy.py
-
-# 可验证发现版（隐私版 + 目标签名）
-python3 agentnet_signed.py
-
-# 拓扑来源与维护版（明文 + 熟人表动态生命周期）
-python3 agentnet_topology.py
-
-# churn 容错版（明文 + 节点上下线容错）
-python3 agentnet_churn.py
+# 分机制独立演示版（各自单文件，可直接跑）
+python3 agentnet.py                   # 明文基础版
+python3 agentnet_privacy.py           # 隐私版
+python3 agentnet_signed.py            # 可验证发现版
+python3 agentnet_topology.py          # 拓扑维护版
+python3 agentnet_churn.py             # churn 容错版
 ```
 
 零依赖，仅 Python 标准库。端口 7001–7007 需空闲。
@@ -494,12 +493,42 @@ python3 agentnet_churn.py
 
 | 文件 | 内容 |
 |---|---|
-| `vouch.py` | **整合版（明文完整态）**：发现→协作→拓扑演化→churn→Sybil→身份验证→介绍人担保→向量语义路由 一气呵成 |
+| `vouch_sdk/` | **SDK 包（明文完整态）**：`config`/`crypto`/`semantic`/`agent`/`network` 五模块，import 无副作用，可同进程跑多网络 |
+| `examples/full_flow.py` | 整合演示：发现→协作→拓扑→churn→Sybil→身份验证→介绍人担保→向量语义路由 一气呵成 |
+| `tests/test_smoke.py` | 冒烟测试：import 无副作用 + 双网络同进程隔离 + 发现→协作 |
+| `pyproject.toml` | pip 打包配置（零依赖） |
 | `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作（分机制演示） |
 | `agentnet_privacy.py` | 隐私版：无路径 + 分布式回信令牌 + DH 加密 + 信息流审计 |
 | `agentnet_signed.py` | 可验证发现版：隐私版 + 目标签名 + 完整性校验（RSA 演示） |
 | `agentnet_topology.py` | 拓扑维护版：明文 + 信任度随协作升降 + 衰减 + 拉黑 + churn/恶意区分 + Sybil 防御 |
 | `agentnet_churn.py` | churn 容错版：明文 + 回程绕断点 + 去程多路径 + 源重试 |
 
-> `vouch.py` 是四个明文分机制版本的整合，跑通端到端全流程。其余 `agentnet_*.py` 是各机制的独立演示版（可单独运行看单个机制）。
+> `vouch_sdk/` 是 SDK 化后的主入口（`from vouch_sdk import Network, Agent`）。`examples/full_flow.py` 是其端到端演示。其余 `agentnet_*.py` 是各机制的独立单文件演示版（可单独运行看单个机制，未 SDK 化）。
+
+## 11. SDK 化：全局单例 → Network 对象
+
+原 `vouch.py` 是 1000 行单文件原型，有四个模块级可变全局：
+
+| 原全局 | 含义 | SDK 化归宿 |
+|---|---|---|
+| `REGISTRY` | 节点注册表 `name → Agent` | `Network.registry` |
+| `_DOWN` | 下线节点名集合 | `Network.down` |
+| `_CLOCK` | 全局逻辑时钟 | `Network.clock` |
+| `_COUNT` | 消息计数 | `Network.counts` |
+
+它们让"import 即有状态、同进程跑不了两个网络"——这是原型不是库的根因。
+
+**SDK 化改动**：
+- `Network` 类封装上述四全局，提供 `register/get/all_agents/is_down/mark_down/bump/tick/set_degree_all/build_graph`。
+- `Agent.__init__` 收 `network` 参数，存 `self.net`；所有 `REGISTRY`/`_DOWN`/`_bump`/`tick()` 引用改成 `self.net.*`。`Agent` 不再自己写全局，改由 `network.register(self)` 显式登记。
+- 模块级常量（`DEFAULT_TTL`/`ALPHA`/`ROUTE_TRUST_THRESHOLD` 等）收进 `Config` dataclass，`Network` 持有；不同网络可跑不同参数。
+- 拆成 `config`/`crypto`/`semantic`/`agent`/`network` 五模块 + `__init__` 公共导出；`main()` 迁到 `examples/full_flow.py`。
+- `import vouch_sdk` 无副作用（不启服务器、不写全局）。
+
+**收益**：
+1. 可 `pip install -e .` 装成库，`from vouch_sdk import Network, Agent` 用。
+2. 同进程可构造多个独立 `Network`（旧全局化时代做不到）——见 `test_two_networks_same_process`。
+3. 机制逻辑逐行不变（churn/Sybil/身份验证/语义路由），只换符号引用——输出与旧 `vouch.py` 等价。
+
+**边界**：`agentnet_*.py` 分机制演示版未 SDK 化（各自仍是单文件原型），它们独立于 `vouch_sdk`，互不影响。
 | `DESIGN.md` | 本设计文档 |

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vouch-sdk"
+version = "0.1.0"
+description = "Vouch — trust-routed discovery for personal agents. 参考实现 SDK。"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Chenzhen Ye", email = "yechenzhen2000@163.com" },
+]
+keywords = ["p2p", "trust", "discovery", "agent", "decentralized", "sybil", "routing"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+    "Development Status :: 3 - Alpha",
+]
+dependencies = []  # 零依赖，仅标准库
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+vouch-demo = "vouch_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vouch_sdk*"]
+exclude = ["tests*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
