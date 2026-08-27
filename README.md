@@ -21,6 +21,13 @@ vouch/
 ├── tests/
 │   └── test_smoke.py       冒烟测试（import 无副作用 + 双网络同进程 + 发现→协作）
 ├── pyproject.toml          pip 打包配置（零依赖）
+├── vouch_app/              基于 SDK 的个人助手应用（真联网多进程，REPL）
+│   ├── capabilities.py     四个真实能力执行器（翻译/起草/算账/文本）
+│   ├── topology.py         节点+边配置（6 节点，端口 8001-8006）
+│   ├── node.py             通用节点入口（python -m vouch_app.node <Name>）
+│   ├── assistant.py        助手 async REPL
+│   ├── embedding_ext.py    应用层语义向量扩展（让能力名有语义）
+│   └── run_all.sh          一键起全部 6 进程
 ├── agentnet.py             明文基础版（路由 + 发现即扩展 + 协作，分机制演示）
 ├── agentnet_privacy.py     隐私版（无路径 + 分布式回信令牌 + DH 端到端加密）
 ├── agentnet_signed.py      可验证发现版（隐私版 + 目标签名）
@@ -60,6 +67,41 @@ net2 = Network()
 
 明文版会演示:guided 路由 2 跳命中(2 条消息)vs flood 触达全网(11 条);发现后直接协作;二次查询近 O(1)。
 隐私版额外演示:中继只搬密文不识内容,源只学到「hop=跳数, 找到谁」而非「经过谁」。
+
+## 个人助手应用(基于 SDK)
+
+`vouch_app/` 是基于 vouch_sdk 的**真联网多进程**个人助手:6 个节点各一个进程,通过 TCP 真连。你在助手 REPL 输入任务,助手经熟人链发现能力方 agent,把任务发去执行,返回真实结果。
+
+```bash
+cd vouch
+bash vouch_app/run_all.sh        # 一键起 6 进程(5 能力后台 + 助手前台)
+# 或各终端分别: python3 -m vouch_app.node <Name>
+```
+
+REPL 命令:
+```
+vouch> help                       # 命令帮助
+vouch> contacts                   # 列熟人(地址/标签/信任度/可路由)
+vouch> ask translate hello world  # 发现+执行 → 你好世界
+vouch> ask translate 你好世界      #               → hello world
+vouch> ask draft email to=bob subject=问候 body=近况   # 2跳经Broker→Drafter 起草邮件
+vouch> ask calc loan principal=1000000 rate=0.05 years=30  # → 月供¥5368.22(真实等额本息)
+vouch> ask calc compound principal=10000 rate=0.08 years=10 # → 复利终值
+vouch> ask text count hello world this is a test             # → 词数=6
+vouch> ask text dedup a,b,a,c,b                              # → 去重
+vouch> trust                      # 列信任度(成功协作后能力方 trust 上升)
+vouch> exit
+```
+
+节点拓扑(端口 8001-8006):
+```
+You(助手) ├─ Translator(翻译,1跳直连)
+          └─ Broker(中继) ├─ Drafter(起草,2跳)
+                          ├─ Accountant(算账,2跳)
+                          └─ TextTooler(文本工具,2跳)
+```
+
+能力是真实可跑的(翻译=中英词典、起草=模板、算账=等额本息/复利/汇率公式、文本=词数/去重/排序),零外部依赖。SDK 的反馈循环在应用层自然生效:成功协作 → 能力方 trust 上升;节点下线 → 超时/churn 容错。详见 DESIGN.md §12。
 
 ## 协议要点
 

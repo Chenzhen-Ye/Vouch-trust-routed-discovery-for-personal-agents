@@ -468,6 +468,7 @@ _guided_pick 打分      = cosine(_cap_vec(cap), _tags_vec(a.tags))  # 连续 0~
 | **介绍人担保** | ✅ 已实现 | 见 §4.13：非对称签名，discover 时源经介绍人获可信公钥，介绍人无法冒充 |
 | **向量语义路由** | ✅ 已实现 | 见 §4.14：标签集合交集 → 余弦相似度（连续 0~1），更准且无需维护 RELATED 表 |
 | **SDK 化（全局→对象）** | ✅ 已实现 | 见 §11：REGISTRY/_DOWN/_CLOCK/_COUNT 封进 Network 类，import 无副作用，可同进程跑多网络 |
+| **个人助手应用** | ✅ 已实现 | 见 §12：基于 SDK 的真联网多进程助手，6 节点 TCP 互联，REPL 驱动翻译/起草/算账/文本四能力 |
 | **mixnet 升级** | ⏳ 未实现 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见（且需先恢复隐私版） |
 
 ## 9. 运行说明
@@ -497,6 +498,7 @@ python3 agentnet_churn.py             # churn 容错版
 | `examples/full_flow.py` | 整合演示：发现→协作→拓扑→churn→Sybil→身份验证→介绍人担保→向量语义路由 一气呵成 |
 | `tests/test_smoke.py` | 冒烟测试：import 无副作用 + 双网络同进程隔离 + 发现→协作 |
 | `pyproject.toml` | pip 打包配置（零依赖） |
+| `vouch_app/` | **基于 SDK 的个人助手应用**：真联网多进程，6 节点 TCP 互联，REPL 驱动翻译/起草/算账/文本四真实能力（见 §12） |
 | `agentnet.py` | 明文基础版：路由 + 发现即扩展 + 协作（分机制演示） |
 | `agentnet_privacy.py` | 隐私版：无路径 + 分布式回信令牌 + DH 加密 + 信息流审计 |
 | `agentnet_signed.py` | 可验证发现版：隐私版 + 目标签名 + 完整性校验（RSA 演示） |
@@ -531,4 +533,50 @@ python3 agentnet_churn.py             # churn 容错版
 3. 机制逻辑逐行不变（churn/Sybil/身份验证/语义路由），只换符号引用——输出与旧 `vouch.py` 等价。
 
 **边界**：`agentnet_*.py` 分机制演示版未 SDK 化（各自仍是单文件原型），它们独立于 `vouch_sdk`，互不影响。
-| `DESIGN.md` | 本设计文档 |
+
+## 12. 个人助手应用：基于 SDK 的真联网多进程
+
+`vouch_app/` 把 SDK 从"演示机制"变成"能用的助手"：6 个节点各一个进程，通过 TCP 真连，你在 REPL 输入任务，助手经熟人链发现能力方并执行。
+
+### 12.1 架构
+
+每进程跑一个 `vouch_sdk.Agent`（独立 `Network`），节点通过 TCP 真连：
+
+```
+You(8001,助手REPL) ├─knows→ Translator(8002, translate)        直接邻居
+                   └─knows→ Broker(8003, 无能力中继)           直接邻居
+                              ├─knows→ Drafter(8004, draft)
+                              ├─knows→ Accountant(8005, calc)
+                              └─knows→ TextTooler(8006, text)
+```
+
+- 多跳：`ask draft ...` → You→Broker→Drafter（2 跳）
+- 直命中：`ask translate ...` → You→Translator（1 跳）
+
+### 12.2 真实能力执行器
+
+`capabilities.py` 四个纯函数 `f(task_body) -> str`，被 `node.py` 包装成 `quality_fn`（成功→质量 1.0→trust 升）：
+
+| 能力 | 函数 | 真实执行 |
+|---|---|---|
+| translate | 中英词典词对词 + 短语贪心匹配 | `hello world`↔`你好世界` |
+| draft | 模板填键值 | 邮件 / 合同片段 |
+| calc | 等额本息月供 / 复利终值 / 汇率换算 | `loan 100万 5% 30年 → 月供¥5368.22` |
+| text | 词数 / 去重 / 排序 / 统计 | `count ... → 词数=6` |
+
+零外部依赖，仅标准库。
+
+### 12.3 与 SDK 机制的衔接
+
+- **guided fanout=2（You）**：You 首跳同时问 Translator（翻译直命中）和 Broker（其他能力中转），避免单跳选错邻居→超时→重试的延迟。这是 `Config(guided_fanout=2)` 的正用，不改 SDK。
+- **语义路由**：`embedding_ext.py` 给应用能力名（calc/text/translate/draft）补语义向量，让 `guided_pick` 按能力精准选邻居。否则能力名不在 SDK 的 EMBEDDING 表→零向量→余弦=0→退化成纯 trust 选（失语义）。
+- **反馈循环**：成功协作→能力方 trust 升（0.40→0.46→0.51...）；节点下线→超时→churn 容错生效（§4.10）。
+- **身份验证**：应用层信任=配置文件给的熟人表（你自己配的邻居），`collaborate` 传 `proof=None` 走无验证分支直接执行。SDK 的 HMAC/RSA 身份验证（§4.12-4.13）给不信任的远端熟人链，应用层默认不启用但保留。
+
+### 12.4 设计决策与边界
+
+- **每进程只建自己 + 熟人表**：不在本进程建别的 Agent 实例（它们在别的进程）。`degree` 看不到全局→手设 1 占位；路由靠 sem+trust（hub=0.3*degree/max_deg 权重小），不影响发现。
+- **task 直接是正文**：能力节点 `quality_fn` 固定单能力，直接执行；`ask <cap> <task>` 的 task=剩余正文，各能力自解析参数格式。
+- **零外部依赖**：REPL 用 `loop.run_in_executor(None, input, ...)` 避免 aioconsole；能力全用标准库。
+- **边界**：能力是规则式/模板式（翻译靠词典、起草靠模板、算账靠公式），非 LLM——零依赖原则下真实可跑但能力有限；接 LLM 后端会更强但引入外部依赖与密钥（未做）。翻译词典/汇率表是模块常量，可扩但不自学习。
+
