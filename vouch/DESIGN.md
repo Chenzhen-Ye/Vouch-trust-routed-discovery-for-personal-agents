@@ -469,6 +469,7 @@ _guided_pick 打分      = cosine(_cap_vec(cap), _tags_vec(a.tags))  # 连续 0~
 | **向量语义路由** | ✅ 已实现 | 见 §4.14：标签集合交集 → 余弦相似度（连续 0~1），更准且无需维护 RELATED 表 |
 | **SDK 化（全局→对象）** | ✅ 已实现 | 见 §11：REGISTRY/_DOWN/_CLOCK/_COUNT 封进 Network 类，import 无副作用，可同进程跑多网络 |
 | **个人助手应用** | ✅ 已实现 | 见 §12：基于 SDK 的真联网多进程助手，6 节点 TCP 互联，REPL 驱动翻译/起草/算账/文本四能力 |
+| **LLM 后端** | ✅ 已实现 | 见 §12.5：OpenAI 兼容 API（可指 Ollama 本地），文字能力双轨 LLM+规则降级，calc 留规则式 |
 | **mixnet 升级** | ⏳ 未实现 | 加延迟+批处理，打乱时序关联，藏到对邻居不可见（且需先恢复隐私版） |
 
 ## 9. 运行说明
@@ -578,5 +579,26 @@ You(8001,助手REPL) ├─knows→ Translator(8002, translate)        直接邻
 - **每进程只建自己 + 熟人表**：不在本进程建别的 Agent 实例（它们在别的进程）。`degree` 看不到全局→手设 1 占位；路由靠 sem+trust（hub=0.3*degree/max_deg 权重小），不影响发现。
 - **task 直接是正文**：能力节点 `quality_fn` 固定单能力，直接执行；`ask <cap> <task>` 的 task=剩余正文，各能力自解析参数格式。
 - **零外部依赖**：REPL 用 `loop.run_in_executor(None, input, ...)` 避免 aioconsole；能力全用标准库。
-- **边界**：能力是规则式/模板式（翻译靠词典、起草靠模板、算账靠公式），非 LLM——零依赖原则下真实可跑但能力有限；接 LLM 后端会更强但引入外部依赖与密钥（未做）。翻译词典/汇率表是模块常量，可扩但不自学习。
+- **边界**：能力是规则式/模板式（翻译靠词典、起草靠模板、算账靠公式），非 LLM 时真实可跑但能力有限。LLM 后端（§12.5）可选启用，启用后文字能力升级 LLM、calc 仍规则式。
+
+### 12.5 LLM 后端（可选，OpenAI 兼容）
+
+能力执行双轨：默认规则式（零依赖），配 LLM 后文字能力升级 LLM 驱动。
+
+**配置**（`llm_config.py`，读环境变量，不把密钥入库）：
+- `VOUCH_LLM_BASE_URL` / `OPENAI_BASE_URL`（默认指本地 Ollama `http://localhost:11434/v1`）
+- `VOUCH_LLM_API_KEY` / `OPENAI_API_KEY`（Ollama 不需，"ollama" 占位）
+- `VOUCH_LLM_MODEL`（本地默认 `qwen2.5:1.5b`，远程默认 `gpt-4o-mini`）
+- 未设 → `enabled=False`，全规则式（与未接 LLM 等价）。
+
+**双轨设计**（`node.py make_quality_fn`）：
+- `use_llm(cap_key)`：`enabled` 且 cap 在 `llm_caps=("translate","draft","text")` → 走 LLM。
+- **calc 不接 LLM**：精确计算（等额本息/复利）LLM 不可靠，始终规则式。这是"文字智能+计算精确"的分工。
+- **降级链**：LLM 调用失败（网络/超时/模型不存在）→ catch → 回退规则式 + 质量标 **0.7**（降级不算满质量，区别于 LLM 成功的 1.0 与规则失败的 0.1）。trust 反馈三档：1.0 升 / 0.7 微升 / 0.1 重罚。
+
+**调用层**（`llm_executor.py`）：用标准库 `urllib` 调 `/v1/chat/completions`，**不引入 openai 包**，保持零依赖。兼容 OpenAI 官方、本地 Ollama/LM Studio（都兼容此接口）。`prompts.py` 给每个 LLM 能力 system/user 模板，约束"只输出结果不加解释"，draft 用规则模板作 few-shot 格式引导。
+
+**慢调用协调**：LLM 调用是秒级（timeout 默认 30s），远超任务传输超时（`SEND_TIMEOUT=2s`）。LLM 启用时，You 的 `Config(send_timeout=llm_timeout+5)` 放大等响应超时，否则 LLM 还没回源端已判 churn 超时。
+
+**边界**：LLM 调用在能力节点 `_handle` 里同步阻塞（事件循环卡住期间该节点不接其他连接，演示场景可接受；真并发需 async quality_fn，未做）。能力节点的 `_quality_fn` 同步签名是 SDK 约束，LLM 在其中阻塞——这是当前集成边界。
 

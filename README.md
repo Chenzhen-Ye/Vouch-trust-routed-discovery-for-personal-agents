@@ -27,6 +27,9 @@ vouch/
 │   ├── node.py             通用节点入口（python -m vouch_app.node <Name>）
 │   ├── assistant.py        助手 async REPL
 │   ├── embedding_ext.py    应用层语义向量扩展（让能力名有语义）
+│   ├── llm_config.py       LLM 配置（OpenAI 兼容，读环境变量）
+│   ├── llm_executor.py     LLM 调用（urllib，不引 openai 包）
+│   ├── prompts.py          能力 prompt 模板（translate/draft/text）
 │   └── run_all.sh          一键起全部 6 进程
 ├── agentnet.py             明文基础版（路由 + 发现即扩展 + 协作，分机制演示）
 ├── agentnet_privacy.py     隐私版（无路径 + 分布式回信令牌 + DH 端到端加密）
@@ -102,6 +105,26 @@ You(助手) ├─ Translator(翻译,1跳直连)
 ```
 
 能力是真实可跑的(翻译=中英词典、起草=模板、算账=等额本息/复利/汇率公式、文本=词数/去重/排序),零外部依赖。SDK 的反馈循环在应用层自然生效:成功协作 → 能力方 trust 上升;节点下线 → 超时/churn 容错。详见 DESIGN.md §12。
+
+### LLM 后端(可选,OpenAI 兼容)
+
+能力执行默认规则式(零依赖)。配 OpenAI 兼容 API 后,translate/draft/text 三个文字能力升级为 LLM 驱动;calc 始终规则式(精确计算 LLM 不可靠)。LLM 调用失败自动降级规则式(质量标 0.7)。
+
+```bash
+# 本地 Ollama(离线,推荐先试):先 ollama pull qwen2.5:1.5b
+export VOUCH_LLM_BASE_URL=http://localhost:11434/v1
+export VOUCH_LLM_API_KEY=ollama
+export VOUCH_LLM_MODEL=qwen2.5:1.5b
+bash vouch_app/run_all.sh
+
+# 或指向 OpenAI 官方
+export VOUCH_LLM_BASE_URL=https://api.openai.com/v1
+export VOUCH_LLM_API_KEY=sk-...
+export VOUCH_LLM_MODEL=gpt-4o-mini
+bash vouch_app/run_all.sh
+```
+
+不设这些环境变量 → 全规则式(零依赖,与未接 LLM 时等价)。详见 DESIGN.md §12.5。
 
 ## 协议要点
 
