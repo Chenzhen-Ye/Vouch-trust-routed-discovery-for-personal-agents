@@ -21,16 +21,22 @@ vouch/
 ├── tests/
 │   └── test_smoke.py       冒烟测试（import 无副作用 + 双网络同进程 + 发现→协作）
 ├── pyproject.toml          pip 打包配置（零依赖）
-├── vouch_app/              基于 SDK 的个人助手应用（真联网多进程，REPL）
+├── vouch_app/              基于 SDK 的个人助手应用（编排式 demo + 对等式 peer）
 │   ├── capabilities.py     四个真实能力执行器（翻译/起草/算账/文本）
-│   ├── topology.py         节点+边配置（6 节点，端口 8001-8006）
-│   ├── node.py             通用节点入口（python -m vouch_app.node <Name>）
-│   ├── assistant.py        助手 async REPL
+│   ├── topology.py         编排式节点+边配置（6 节点，端口 8001-8006）
+│   ├── node.py             编排式节点入口（python -m vouch_app.node <Name>）
+│   ├── peer.py             对等节点入口（python -m vouch_app.peer，每人一个）
+│   ├── peer_config.py      PeerConfig + 公钥指纹/blob 编解码
+│   ├── profiles/           对等自测三人组（demo_a/b/c：alice/bob/carol）
+│   ├── backends.py         三后端注册（rule/llm/claude，按能力独立配置）
+│   ├── claude_backend.py   Claude 后端（CLI 优先，Anthropic API 备选）
+│   ├── assistant.py        对等助手 async REPL（whoami/add/verify/ask 担保）
 │   ├── embedding_ext.py    应用层语义向量扩展（让能力名有语义）
 │   ├── llm_config.py       LLM 配置（OpenAI 兼容，读环境变量）
 │   ├── llm_executor.py     LLM 调用（urllib，不引 openai 包）
 │   ├── prompts.py          能力 prompt 模板（translate/draft/text）
-│   └── run_all.sh          一键起全部 6 进程
+│   ├── run_all.sh          编排式：一键起全部 6 进程
+│   └── run_peers.sh        对等式：一键起 3 peer 自测
 ├── agentnet.py             明文基础版（路由 + 发现即扩展 + 协作，分机制演示）
 ├── agentnet_privacy.py     隐私版（无路径 + 分布式回信令牌 + DH 端到端加密）
 ├── agentnet_signed.py      可验证发现版（隐私版 + 目标签名）
@@ -126,6 +132,44 @@ bash vouch_app/run_all.sh
 
 不设这些环境变量 → 全规则式(零依赖,与未接 LLM 时等价)。详见 DESIGN.md §12.5。
 
+## 对等应用(每人电脑上一个节点)
+
+`vouch_app/peer.py` 是对等模式的入口:每人电脑跑一个 peer,无角色差异,互相发现、协作执行。与 §12 编排式(单机 6 节点演示)的区别:无 topology 硬编码,配置只描述"我自己"(我的能力+后端、我的引导熟人);跨机互联(SDK 已带 host 维度);公钥交换+介绍人担保身份验证全程启用。
+
+```bash
+cd vouch
+# 一键自测:carol/bob 后台服务 + alice 前台 REPL(三人链式拓扑)
+bash vouch_app/run_peers.sh
+
+# 真实跨机:各自电脑上
+python3 -m vouch_app.peer --name 你的名字 --port 9000 \
+  --cap translate:llm --cap draft:claude \
+  --bootstrap "朋友@192.168.1.5:9000:translate,draft" \
+  --advertise-host 你的IP
+```
+
+流程(两台电脑第一次互连):
+```
+1. 各自启动 peer,REPL 里 whoami → 打印公钥指纹 + PUB blob
+2. 微信/当面把指纹和 blob 发给对方(带外,协议不自动化这步)
+3. add 对方名字 地址:端口 标签 0.8 <PUB_BLOB>
+4. ask calc loan principal=1000000 rate=0.05 years=30 → 经熟人链发现+担保验证+执行
+```
+
+REPL 新增命令:
+```
+vouch> whoami                        # 名字/地址/公钥指纹/能力 + PUB(给对方复制)
+vouch> add bob 127.0.0.1:9002 draft,writing 0.8 <PUB_BLOB>   # 加引导熟人
+vouch> verify bob                    # 显示对方公钥指纹(带外人工核对)
+vouch> contacts                      # 熟人表(含公钥交换状态)
+vouch> ask draft email to=x subject=y body=z    # 发现→担保验证→claude 后端起草
+```
+
+能力后端三选一(每个能力独立配):`rule`(规则式,零依赖)/`llm`(OpenAI 兼容)/`claude`(Claude Code CLI 优先,ANTHROPIC_API_KEY 备选)。失败降级链:claude/llm → rule(质量 0.7);calc 强制 rule。
+
+身份验证三条路径(SDK collaborate 自动选):(a) HMAC 直验(持 secret)/ (c) 直连公钥直验(带外换过公钥)/ (b) 介绍人担保(多跳,介绍人签过 target_pub)。伪造公钥冒充实测被拒;节点重启=新密钥,旧公钥验不过 → 需重新交换(身份不因重启遗忘)。详见 DESIGN.md §13。
+
+
 ## 协议要点
 
 - **两种查询模式**:`discover`(按能力找人)、`lookup`(按身份找人)
@@ -154,7 +198,7 @@ Vouch 本质是**信任受限社交叠加图上的分布式路由**。对照已�
 
 ## 已知局限
 
-当前明文协议机制已完整(详见 DESIGN.md §8):churn 容错、Sybil 防御、可验证发现、身份验证联动、介绍人担保、向量语义路由均已实现,并 SDK 化为可 import 的库。尚未实现:mixnet 升级(需先恢复隐私版)、多介绍人交叉验证(防"换公钥冒充")。
+当前明文协议机制已完整(详见 DESIGN.md §8):churn 容错、Sybil 防御、可验证发现、身份验证联动、介绍人担保、向量语义路由均已实现,SDK 化为可 import 的库,并有对等应用(§13:每人电脑一个节点,跨机互联+公钥交换+三后端能力)。尚未实现:mixnet 升级(需先恢复隐私版)、多介绍人交叉验证(防"换公钥冒充")。
 
 ## License
 

@@ -602,3 +602,53 @@ You(8001,助手REPL) ├─knows→ Translator(8002, translate)        直接邻
 
 **边界**：LLM 调用在能力节点 `_handle` 里同步阻塞（事件循环卡住期间该节点不接其他连接，演示场景可接受；真并发需 async quality_fn，未做）。能力节点的 `_quality_fn` 同步签名是 SDK 约束，LLM 在其中阻塞——这是当前集成边界。
 
+
+## 13 对等应用：每人电脑上的真实节点
+
+§12 的编排式（topology 写死 6 节点）是"单机演示"；§13 升级为**对等式**：每人电脑跑一个 peer（`vouch_app/peer.py`），无角色差异，互相发现、协作执行。
+
+### 13.1 SDK 跨机化（Acquaintance 带 host）
+
+跨机必须改 SDK：原 `_send/_send_task` 固定连 `127.0.0.1`。
+
+- `Acquaintance` 加 `host` 字段（默认 `127.0.0.1`，向后兼容：旧单机代码不变）。
+- `knows()` 加 `host` 参数；`Agent.__init__` 加 `host`（对外宣称地址，path/found 里携带）。
+- 消息传输 `_send/_send_task` 加 `host` 形参：转发用熟人 `a.host`，回程用 path 跳 `hop["host"]`，协作用 `found["host"]`；显式传参优先，按端口查熟人表兜底（跨机可能复用端口号，显式优先）。
+- `discover/lookup` 的 `path` 条目与 `found` 响应都带 `host` —— 回程/协作按它寻址。
+
+### 13.2 对等节点（peer.py + peer_config.py）
+
+- **PeerConfig**：只描述"我自己"——名字/端口/能力（每个能力独立选后端）/引导熟人（带 host:port+tags+trust）。`profiles/` 提供自测三人组（alice/bob/carol 链式拓扑，演示多跳）。
+- **一键自测**：`bash vouch_app/run_peers.sh`（carol→bob 顺序起服务 + alice 前台 REPL）。
+- **临时节点**：`--name dave --port 9100 --cap text --bootstrap "bob@127.0.0.1:9002:text,calc"` 全 CLI 参数建 peer，随时入网。
+- **公钥交换**（§4.13 落地）：密钥对启动生成（不落盘）；`whoami` 打印指纹（SHA256 前 16 hex）+ 公钥 blob；`add <name> <host:port> <tags> [trust] [pub_blob]` 粘贴对方 blob。自测用 `pub_dir` 共享目录模拟带外信道（含启动竞态兜底：5s 阻塞等待 + 30s 后台补齐）。
+
+### 13.3 三条身份验证路径（SDK collaborate）
+
+ask 时把 discover 响应的签名材料作 proof 传入，SDK 按场景自动选路：
+
+| 路径 | 场景 | 验证方式 |
+|---|---|---|
+| (a) HMAC 直验 | 源预持目标 secret（lookup） | `hmac_verify(secret, found_json)` |
+| (c) **公钥直验**（§13 新增） | **对等直连**：我带外换过目标公钥 | 响应 target_pub == 我持公钥 且 `rsa_verify` 通过 |
+| (b) 介绍人担保 | 多跳：介绍人持目标公钥 | 验介绍人 voucher_sig → 用其担保的 target_pub 验 target_sig |
+
+路径 (c) 是对等化的必要补充：原 SDK 只有 (a)(b)，直连场景（介绍人=我自己）无路可走。非对称性同 (b)：我能验不能签，对端无法冒充——已实测伪造公钥的 add 后 ask 被拒（"响应公钥与我持有的不符（冒充）"）。
+
+### 13.4 三后端能力执行（backends.py）
+
+每个能力独立声明后端：`caps: [{cap: translate, backend: llm}]`。
+
+- **rule**：`capabilities.py` 规则式（零依赖基座）。
+- **llm**：§12.5 的 OpenAI 兼容路径（Ollama/OpenAI/LM Studio）。
+- **claude**：`claude_backend.py` —— 优先 Claude Code CLI（`claude -p`，零依赖），备选 Anthropic API（`ANTHROPIC_API_KEY`）。
+- **降级链**：claude/llm 失败 → 有 rule 实现则降级（质量 0.7）；calc 强制 rule（精确计算不给模型）。
+- **task 带 cap 前缀**：对等节点一进程多能力，`ask <cap> <task>` 的 task 首词=能力名，`backends.make_quality_fn` 按首词路由到对应执行器。
+
+### 13.5 qid 随机前缀（跨进程网络的真 bug 修复）
+
+原 qid=`name-序号`：节点重启后序号归零，与全网残留的 `_seen` 撞车 → 重启节点的查询被当重复丢弃。修复：qid 加启动随机前缀 `name-<hex4>-序号`。这是长生命周期对等网络（进程可重启）倒逼出的修复，单机 demo 永远暴露不了。
+
+### 13.6 密钥变更语义（实测确认）
+
+节点重启 = 新密钥对 → 旧熟人持旧公钥 → 担保/直验失败 → 拒绝协作（"target_sig 验签失败——不担保"）。这是**正确**的身份语义：密钥变更需重新带外交换公钥（`whoami` → `add`）。churn 容错（重试+fanout 升级+flood）由 SDK 内建，但身份不因重启而"遗忘"——信任与身份分离。

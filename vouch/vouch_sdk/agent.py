@@ -30,12 +30,16 @@ class Acquaintance:
     intro_count: int = 0     # 本周期已引荐的新面孔数（Sybil 引荐名额）
     secret: bytes = b""       # 我预先持有的该熟人的 HMAC 身份密钥（lookup 验身份）
     pub: dict = None          # 我预先持有的该熟人的 RSA 公钥（discover 介绍人担保验身份）
+    host: str = "127.0.0.1"   # 对方所在机器（跨机协作连接用；本机 demo 恒 127.0.0.1）
 
 
 class Agent:
-    def __init__(self, name, port, caps, network: Network, quality_fn=None):
+    def __init__(self, name, port, caps, network: Network, quality_fn=None, host=None):
         self.name = name
         self.port = port
+        # 本机监听地址：默认用网络配置的 host（本机 demo 为 127.0.0.1）。
+        # 跨机部署时各 peer 可显式指定自己的可达地址。
+        self.host = host or network.config.host
         self.caps = frozenset(caps)
         self.net = network          # ★ 持有所属网络（替代旧全局 REGISTRY/_DOWN/...）
         self.acq: dict = {}
@@ -51,16 +55,21 @@ class Agent:
         # 非对称密钥对：priv 自己持（签名），pub 作为身份公钥（带外分发给信任方）。
         # 介绍人担保用：目标用 priv 签 found（只有目标能签），介绍人/源用 pub 验。
         self._rsa_priv, self.rsa_pub = gen_keypair(256)
+        # 查询 id 加随机前缀：节点重启后序号归零,若只按 name-序号,全网残留的
+        # _seen 会把重启节点的查询当重复丢弃(跨进程长生命周期网络的真 bug)。
+        self._qid_prefix = f"{name}-{secrets.token_hex(4)}"
         network.register(self)      # ★ 显式注册（替代旧 REGISTRY[name] = self）
 
     @property
     def _cfg(self) -> Config:
         return self.net.config
 
-    def knows(self, other_name, port, tags, trust=0.8, secret=b"", pub=None):
+    def knows(self, other_name, port, tags, trust=0.8, secret=b"", pub=None,
+              host="127.0.0.1"):
         # secret：HMAC 身份密钥（lookup）；pub：RSA 公钥（discover 介绍人担保）。带外信任锚。
+        # host：对方所在机器——跨机时必填，本机 demo 默认 127.0.0.1（向后兼容）。
         self.acq[other_name] = Acquaintance(other_name, port, set(tags), trust,
-                                           secret=secret, pub=pub)
+                                           secret=secret, pub=pub, host=host)
 
     def _name_of_port(self, port):
         for a in self.acq.values():
@@ -107,14 +116,26 @@ class Agent:
         elif msg["type"] == "response":
             await self._on_response(msg)
 
-    async def _send(self, port, msg, timeout=None):
-        """发消息，返回 True/False。失败（对方下线/超时）返回 False——回程绕断点的前提。"""
+    def _host_of_port(self, port):
+        """按端口查熟人所在机器。跨机时各熟人在不同 host；查不到回退本机。
+        注意：跨机场景不同机器可能复用同一端口号——调用方已知目标 host 时
+        应优先显式传 host，这里只是兜底。"""
+        for a in self.acq.values():
+            if a.port == port:
+                return a.host
+        return self._cfg.host
+
+    async def _send(self, port, msg, timeout=None, host=None):
+        """发消息，返回 True/False。失败（对方下线/超时）返回 False——回程绕断点的前提。
+        host：目标所在机器。显式传入优先；否则按端口查熟人表（本机 demo 兜底）。"""
         if timeout is None:
             timeout = self._cfg.send_timeout
         kind = msg.get("strategy") if msg["type"] == "query" else msg["type"]
         self.net.bump(kind)
+        target = host or self._host_of_port(port)
         try:
-            r, w = await asyncio.wait_for(asyncio.open_connection(self._cfg.host, port), timeout=timeout)
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(target, port), timeout=timeout)
             w.write((json.dumps(msg) + "\n").encode())
             await w.drain()
             await asyncio.wait_for(r.readline(), timeout=timeout)
@@ -144,7 +165,7 @@ class Agent:
             msg = {"type": "query", "mode": "discover", "capability": capability,
                    "strategy": cur_strat, "ttl": ttl, "query_id": qid,
                    "fanout": cur_fanout,
-                   "path": [{"name": self.name, "port": self.port}]}
+                   "path": [{"name": self.name, "port": self.port, "host": self.host}]}
             tag = f"尝试{attempt+1}" if attempt else "发起"
             print(f"\n{self.tag} {tag} discover(cap={capability}, strat={cur_strat}, "
                   f"fanout={cur_fanout})")
@@ -172,13 +193,13 @@ class Agent:
         msg = {"type": "query", "mode": "lookup", "target": target,
                "strategy": "guided", "ttl": ttl, "query_id": qid,
                "fanout": cfg.guided_fanout, "hints": list(hints),
-               "path": [{"name": self.name, "port": self.port}]}
+               "path": [{"name": self.name, "port": self.port, "host": self.host}]}
         print(f"\n{self.tag} 发起 lookup(target={target}, hints={list(hints)})")
         await self._forward(msg, cfg.guided_fanout)
         return await self._await(qid)
 
     def _next_qid(self):
-        q = f"{self.name}-{self._qctr}"
+        q = f"{self._qid_prefix}-{self._qctr}"
         self._qctr += 1
         return q
 
@@ -197,12 +218,13 @@ class Agent:
         if qid in self._seen:
             return
         self._seen.add(qid)
-        path = msg["path"] + [{"name": self.name, "port": self.port}]
+        path = msg["path"] + [{"name": self.name, "port": self.port, "host": self.host}]
         hit = (msg["mode"] == "lookup" and msg["target"] == self.name) or \
               (msg["mode"] == "discover" and msg["capability"] in self.caps)
         if hit:
             print(f"{self.tag} ✓ 命中！路径={' → '.join(p['name'] for p in path)}")
-            found = {"name": self.name, "port": self.port, "caps": sorted(self.caps)}
+            found = {"name": self.name, "port": self.port, "host": self.host,
+                     "caps": sorted(self.caps)}
             found_json = json.dumps(found, sort_keys=True).encode()
             # 身份验证（两条路径并存）：
             # (a) HMAC：用自己的 secret 签 found（lookup 场景，源预先持我的 secret 可验）
@@ -234,18 +256,19 @@ class Agent:
             return
         fanout = fanout or cfg.guided_fanout
         if msg.get("strategy") == "flood":
-            ports = [a.port for a in cands]
+            picked = cands
         else:
-            ports = self._guided_pick(msg, cands, fanout)
-        names = [self._name_of_port(p) for p in ports]
+            picked = self._pick_acqs(msg, cands, fanout)
+        names = [a.name for a in picked]
         weak = [n for n, a in self.acq.items() if not a.blocked and a.trust < cfg.route_trust_threshold]
         print(f"{self.tag} 转发(ttl={msg['ttl']}, strat={msg.get('strategy')}, "
               f"fanout={fanout}) → {names}"
               + (f"  [弱连接不路由: {weak}]" if weak else ""))
-        for p in ports:
-            await self._send(p, msg)
+        for a in picked:
+            await self._send(a.port, msg, host=a.host)
 
-    def _guided_pick(self, msg, cands, fanout):
+    def _pick_acqs(self, msg, cands, fanout):
+        """打分选路，返回 Acquaintance 列表（转发方需要 a.host 建立跨机连接）。"""
         cap = msg.get("capability")
         hints = frozenset(msg.get("hints", ()))
         visited = {p["name"] for p in msg["path"]}
@@ -266,7 +289,9 @@ class Agent:
             trust_w = 0.2 * a.trust                 # 更信的人更愿意把话筒给他
             scored.append((sem + hub + trust_w, a.trust, a.port))
         scored.sort(reverse=True)
-        return [p for _, _, p in scored[:fanout]]
+        # 同分同名排序下按端口找回 Acquaintance 对象（cands 内端口唯一）
+        by_port = {a.port: a for a in cands}
+        return [by_port[s[2]] for s in scored[:fanout]]
 
     # ---------- 响应回传：沿 path 往回找，断点绕过 ----------
     async def _reply_back(self, resp, path):
@@ -275,14 +300,14 @@ class Agent:
             hop = path[idx]
             if hop["name"] == self.name:
                 continue
-            ok = await self._send(hop["port"], resp)
+            ok = await self._send(hop["port"], resp, host=hop.get("host"))
             if ok:
                 if idx < len(path) - 2:
                     print(f"{self.tag} 绕过断点：跳过 {path[idx+1]['name']}，直连 {hop['name']}")
                 return
             print(f"{self.tag} 回程 {hop['name']} 下线，往回找更上游")
         print(f"{self.tag} 回程所有中继下线，直连源 {path[0]['name']}")
-        await self._send(path[0]["port"], resp)
+        await self._send(path[0]["port"], resp, host=path[0].get("host"))
 
     async def _on_response(self, msg):
         """中继收到响应：往源方向转发，断点绕过。
@@ -316,14 +341,14 @@ class Agent:
             hop = path[idx]
             if hop["name"] == self.name:
                 continue
-            ok = await self._send(hop["port"], msg)
+            ok = await self._send(hop["port"], msg, host=hop.get("host"))
             if ok:
                 if idx < i - 1:
                     print(f"{self.tag} 绕过断点：跳过 {path[i-1]['name']}，直连 {hop['name']}")
                 return
             print(f"{self.tag} 回程 {hop['name']} 下线，往回找更上游")
         print(f"{self.tag} 回程所有上游下线，直连源 {path[0]['name']}")
-        await self._send(path[0]["port"], msg)
+        await self._send(path[0]["port"], msg, host=path[0].get("host"))
 
     def _deliver(self, resp):
         path = resp["path"]
@@ -346,6 +371,7 @@ class Agent:
         cfg = self._cfg
         name = found["name"]
         port = found["port"]
+        target_host = found.get("host")   # 跨机协作：目标所在机器（跨机查询响应里带回）
         print(f"{self.tag} 向 {name} 发起协作：「{task}」")
         acq = self.acq.get(name)
         if acq is None:
@@ -367,6 +393,17 @@ class Agent:
                 verified = hmac_verify(acq.secret, found_json, proof["hmac_sig"])
                 if verified:
                     print(f"  {self.tag} ✓ HMAC 身份验证通过：确认是 {name} 本人")
+            # 路径(c)：直连公钥直验（对等场景）：我带外换过目标公钥（acq.pub），
+            # 响应里带 target_pub/target_sig——直接验:签名对得上 + 公钥就是我持有的那张。
+            # 非对称性与 (b) 同理：我能验不能签，对端无法冒充。
+            if not verified and proof.get("target_sig") and acq.pub:
+                if proof.get("target_pub") == acq.pub:
+                    verified = rsa_verify(acq.pub, found_json, int(proof["target_sig"]))
+                    if verified:
+                        print(f"  {self.tag} ✓ 公钥直验通过（带外交换的公钥）:确认是 {name} 本人")
+                else:
+                    print(f"  {self.tag} ✗ 响应公钥与我持有的 {name} 公钥不符（冒充）: "
+                          f"响应={proof.get('target_pub')} 我持={acq.pub}")
             # 路径(b)：介绍人担保
             if not verified and proof.get("vouchers") and proof.get("target_sig"):
                 intro = proof.get("introducer")
@@ -407,7 +444,7 @@ class Agent:
 
         outcome = None
         for attempt in range(1, cfg.collab_retries + 2):
-            outcome = await self._send_task(port, task)
+            outcome = await self._send_task(port, task, host=target_host)
             if outcome is not None:
                 break
             if attempt <= cfg.collab_retries:
@@ -453,13 +490,15 @@ class Agent:
         if acq.trust < cfg.block_threshold:
             acq.blocked = True
 
-    async def _send_task(self, port, task, timeout=None):
+    async def _send_task(self, port, task, timeout=None, host=None):
         cfg = self._cfg
         if timeout is None:
             timeout = cfg.send_timeout
         self.net.bump("task")
+        target = host or self._host_of_port(port)
         try:
-            r, w = await asyncio.wait_for(asyncio.open_connection(cfg.host, port), timeout=2)
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(target, port), timeout=2)
         except (OSError, asyncio.TimeoutError):
             return None
         try:
@@ -507,5 +546,6 @@ class Agent:
                 return False
             intro_acq.intro_count += 1
         self.acq[found["name"]] = Acquaintance(found["name"], found["port"],
-            set(found.get("caps", [])), trust, degree=1, last_seen=self.net.tick())
+            set(found.get("caps", [])), trust, degree=1, last_seen=self.net.tick(),
+            host=found.get("host", "127.0.0.1"))
         return True
